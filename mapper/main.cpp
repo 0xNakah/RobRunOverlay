@@ -31,6 +31,8 @@ typedef struct _SYSTEM_MODULE_ENTRY { uintptr_t Section; uintptr_t MappedBase; u
 typedef struct _SYSTEM_MODULE_INFORMATION { uint32_t Count; SYSTEM_MODULE_ENTRY Module[1]; } SYSTEM_MODULE_INFORMATION, *PSYSTEM_MODULE_INFORMATION;
 typedef enum _SYSTEM_INFORMATION_CLASS { SystemModuleInformation = 11 } SYSTEM_INFORMATION_CLASS;
 typedef NTSTATUS (NTAPI *PNtQuerySystemInformation)(SYSTEM_INFORMATION_CLASS, PVOID, ULONG, PULONG);
+typedef PVOID (NTAPI *PExAllocatePoolWithTag)(POOL_TYPE, SIZE_T, ULONG);
+enum PoolType { NonPagedPool = 0, PagedPool = 1, NonPagedPoolMustSucceed = 2 };
 #pragma pack(pop)
 
 static BOOL read_file(const wchar_t* path, std::vector<uint8_t>& out) {
@@ -139,6 +141,43 @@ static uintptr_t get_ntoskrnl_base() {
     return 0;
 }
 
+// Allocate executable non-paged kernel pool by invoking ExAllocatePoolWithTag
+// through a shellcode stub executed in kernel context via the PhysicalMemory
+// read/write primitive. Returns the allocated kernel address or 0 on failure.
+static uintptr_t allocate_kernel_pool(primitive::KernelRW& rw, uintptr_t exAllocPool, SIZE_T size, ULONG tag) {
+    // x64 shellcode: mov rcx, <tag>; mov rdx, <size>; mov r8, <pool_type>; call <exAllocPool>; ret
+    // We write the shellcode + args into a temporary kernel buffer, then execute it.
+    // Simplified: we write a small stub into kernel memory and trigger execution.
+    // The PhysicalMemory primitive allows arbitrary kernel RW but not direct execution,
+    // so we rely on the driver's IOCTL to copy shellcode and jump to it.
+    // For now, we construct the shellcode locally and write it via the primitive,
+    // then signal the driver to execute it.
+
+    uint8_t shellcode[] = {
+        0x48, 0xB9, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // mov rcx, tag (8 bytes, patched)
+        0x48, 0xBA, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // mov rdx, size (8 bytes, patched)
+        0x41, 0xB8, 0x00, 0x00, 0x00, 0x00,                        // mov r8d, pool_type (4 bytes, patched)
+        0xFF, 0xD2,                                                // call rdx (placeholder; patched to exAllocPool)
+        0xC3                                                       // ret
+    };
+
+    // Patch the shellcode with actual values
+    // Note: In a real implementation we'd need a way to execute kernel shellcode.
+    // This is a framework placeholder showing the intended approach.
+    uintptr_t tagPtr = reinterpret_cast<uintptr_t>(&shellcode[2]);
+    uintptr_t sizePtr = reinterpret_cast<uintptr_t>(&shellcode[12]);
+    uintptr_t poolPtr = reinterpret_cast<uintptr_t>(&shellcode[22]);
+    uintptr_t callPtr = reinterpret_cast<uintptr_t>(&shellcode[26]);
+
+    // The above are local addresses; kernel execution requires driver support.
+    // We log the resolved ExAllocatePoolWithTag address for the next step.
+    fwprintf(stderr, L"[!] ExAllocatePoolWithTag resolved at 0x%llX - kernel execution stub needed\n", exAllocPool);
+    fwprintf(stderr, L"[!] Pool size: 0x%llX, Tag: %c%c%c%c\n", size,
+        (tag >> 24) & 0xFF, (tag >> 16) & 0xFF, (tag >> 8) & 0xFF, tag & 0xFF);
+
+    return 0; // Placeholder - actual allocation requires driver execution primitive
+}
+
 int wmain(int argc, wchar_t* argv[]) {
     if (argc < 2) {
         fwprintf(stderr, L"Usage: %s <driver.sys> [ntoskrnl_base]\n", argv[0]);
@@ -197,6 +236,14 @@ int wmain(int argc, wchar_t* argv[]) {
     uintptr_t exAllocPool = resolve_kernel_export(rw, ntoskrnlBase, "ExAllocatePoolWithTag");
     if (exAllocPool) {
         fwprintf(stderr, L"[+] ExAllocatePoolWithTag at 0x%llX\n", exAllocPool);
+
+        // Allocate kernel pool for the driver image
+        uintptr_t kernelAddr = allocate_kernel_pool(rw, exAllocPool, imageSize, 0x52756E44); // 'RunD'
+        if (kernelAddr) {
+            fwprintf(stderr, L"[+] Kernel pool allocated at 0x%llX\n", kernelAddr);
+        } else {
+            fwprintf(stderr, L"[-] Kernel pool allocation requires driver execution support\n");
+        }
     } else {
         fwprintf(stderr, L"[-] Failed to resolve ExAllocatePoolWithTag\n");
     }
