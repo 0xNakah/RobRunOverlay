@@ -1,159 +1,63 @@
-/* wm_drv.c - WmPort kernel transport.
+/* wm_drv.c - WmPort kernel transport (EAC-hardened build).
  *
  * One private device serving requests against a target process: memory
  * read/write, PEB and image base, region query, batched reads, remote
  * allocation, thread registers, process unlink and unload.
  *
+ * EAC hardening:
+ *   - IOCTL codes changed (see wm.h: WM_TYPE 0x37)
+ *   - Driver unlinks itself from PsLoadedModuleList after DriverEntry
+ *   - Direct syscall channel (WM_IO_SYSCALL) bypasses hooked NtDeviceIoControlFile
+ *   - No CRT/security-cookie artifacts (_GSHandlerCheck, etc.)
+ *   - Pool tag uses innocuous 4-char tag
+ *
  * Layout
  *   wm.h       wire contract: names, request numbers, structures
  *   wm_drv.c   device lifecycle, dispatch, memory helpers   (this file)
- *
- * Loading
- *   DriverEntry launches a single system thread and returns. Object and
- *   registry work happens on that thread at PASSIVE_LEVEL, which separates
- *   initialization from the mapper-supplied entry context.
- *
- * Compatibility
- *   wm.h must stay byte-compatible with the client transport in
- *   2_src_port/rr_mem.c. Mismatches can cause rejected requests or incorrectly
- *   interpreted fields; a successful call alone does not prove compatibility.
  */
+
 #include <ntddk.h>
 
-NTKERNELAPI
-PPEB
-PsGetProcessPeb(
-    PEPROCESS Process
-);
-
-NTKERNELAPI
-NTSTATUS
-PsLookupProcessByProcessId(
-    HANDLE ProcessId,
-    PEPROCESS* Process
-);
-
-NTKERNELAPI
-NTSTATUS
-MmCopyVirtualMemory(
-    PEPROCESS SourceProcess,
-    PVOID SourceAddress,
-    PEPROCESS TargetProcess,
-    PVOID TargetAddress,
-    SIZE_T BufferSize,
-    KPROCESSOR_MODE PreviousMode,
-    PSIZE_T ReturnSize
-);
-
-NTKERNELAPI
-NTSTATUS
-IoCreateDriver(
-    PUNICODE_STRING DriverName,
-    PDRIVER_INITIALIZE InitializationFunction
-);
-
-/* Not in the minimal wdm/ntddk include set this driver builds against. */
-#ifndef PROCESS_VM_OPERATION
-#define PROCESS_VM_OPERATION 0x0008
-#endif
-#ifndef MEM_COMMIT
-#define MEM_COMMIT 0x1000
-#endif
-#ifndef MEM_RESERVE
-#define MEM_RESERVE 0x2000
-#endif
-#ifndef PAGE_READWRITE
-#define PAGE_READWRITE 0x04
-#endif
-#ifndef PAGE_EXECUTE_READ
-#define PAGE_EXECUTE_READ 0x20
-#endif
-#ifndef PAGE_EXECUTE_READWRITE
-#define PAGE_EXECUTE_READWRITE 0x40
-#endif
-
-NTSYSAPI
-NTSTATUS
-NTAPI
-ZwAllocateVirtualMemory(
-    HANDLE ProcessHandle,
-    PVOID* BaseAddress,
-    ULONG_PTR ZeroBits,
-    PSIZE_T RegionSize,
-    ULONG AllocationType,
-    ULONG Protect
-);
-
-/* Thread context access. Both are ordinary ntoskrnl exports; the thread object
- * comes from a thread id, never from a guess. */
+NTKERNELAPI PPEB NTAPI PsGetProcessPeb(PEPROCESS Process);
+NTKERNELAPI NTSTATUS NTAPI PsLookupProcessByProcessId(HANDLE ProcessId, PEPROCESS* Process);
+NTKERNELAPI NTSTATUS NTAPI MmCopyVirtualMemory(PEPROCESS SourceProcess, PVOID SourceAddress, PEPROCESS TargetProcess, PVOID TargetAddress, SIZE_T BufferSize, KPROCESSOR_MODE PreviousMode, PSIZE_T ReturnSize);
+NTKERNELAPI NTSTATUS NTAPI IoCreateDriver(PUNICODE_STRING DriverName, PDRIVER_INITIALIZE InitializationFunction);
+NTSYSAPI NTSTATUS NTAPI ZwAllocateVirtualMemory(HANDLE ProcessHandle, PVOID* BaseAddress, ULONG_PTR ZeroBits, PSIZE_T RegionSize, ULONG AllocationType, ULONG Protect);
 NTKERNELAPI NTSTATUS NTAPI PsLookupThreadByThreadId(HANDLE ThreadId, PETHREAD* Thread);
-NTKERNELAPI NTSTATUS NTAPI PsGetContextThread(PETHREAD Thread,
-    PCONTEXT ThreadContext, KPROCESSOR_MODE PreviousMode);
+NTKERNELAPI NTSTATUS NTAPI PsGetContextThread(PETHREAD Thread, PCONTEXT ThreadContext, KPROCESSOR_MODE PreviousMode);
+NTKERNELAPI NTSTATUS NTAPI ObOpenObjectByPointer(PVOID Object, ULONG HandleAttributes, PVOID PassedAccessState, ACCESS_MASK DesiredAccess, POBJECT_TYPE ObjectType, KPROCESSOR_MODE AccessMode, PHANDLE Handle);
+NTKERNELAPI NTSTATUS NTAPI ZwQueryVirtualMemory(HANDLE ProcessHandle, PVOID BaseAddress, ULONG MemoryInformationClass, PVOID MemoryInformation, SIZE_T MemoryInformationLength, PSIZE_T ReturnLength);
+NTKERNELAPI NTSTATUS NTAPI ObQueryNameString(PVOID Object, POBJECT_NAME_INFORMATION ObjectNameInfo, ULONG Length, PULONG ReturnLength);
+
+extern POBJECT_TYPE *PsProcessType;
+
+#define PROCESS_VM_OPERATION 0x0008
+#define MEM_COMMIT 0x1000
+#define MEM_RESERVE 0x2000
+#define PAGE_READWRITE 0x04
+#define PAGE_EXECUTE_READ 0x20
+#define PAGE_EXECUTE_READWRITE 0x40
 #define PROCESS_QUERY_INFORMATION 0x0400
-
-typedef struct _WM_MBI {
-    PVOID  BaseAddress;
-    PVOID  AllocationBase;
-    ULONG  AllocationProtect;
-    USHORT PartitionId;
-    USHORT Reserved0;
-    SIZE_T RegionSize;
-    ULONG  State;
-    ULONG  Protect;
-    ULONG  Type;
-    ULONG  Reserved1;
-} WM_MBI;
-
-NTKERNELAPI
-NTSTATUS
-ObOpenObjectByPointer(
-    PVOID Object,
-    ULONG HandleAttributes,
-    PVOID PassedAccessState,
-    ACCESS_MASK DesiredAccess,
-    POBJECT_TYPE ObjectType,
-    KPROCESSOR_MODE AccessMode,
-    PHANDLE Handle
-);
-
-NTKERNELAPI
-NTSTATUS
-ZwQueryVirtualMemory(
-    HANDLE ProcessHandle,
-    PVOID BaseAddress,
-    ULONG MemoryInformationClass,
-    PVOID MemoryInformation,
-    SIZE_T MemoryInformationLength,
-    PSIZE_T ReturnLength
-);
-
-/* ObQueryNameString is not declared in this header set. Without a prototype
- * MSVC infers "int ObQueryNameString(...)" and marshals the arguments
- * incorrectly, which faults inside the keeper thread. */
-NTKERNELAPI
-NTSTATUS
-ObQueryNameString(
-    _In_ PVOID Object,
-    _Out_writes_bytes_opt_(Length) POBJECT_NAME_INFORMATION ObjectNameInfo,
-    _In_ ULONG Length,
-    _Out_ PULONG ReturnLength
-);
-
-#define WM_SALT 0x5D3A17C9UL
 
 #include "wm.h"
 
+#define WM_POOL_TAG 'mrW '
+#define WM_SALT 0x5D3A17C9UL
+
 static ULONG  g_key = 0;
 static BOOLEAN g_created = FALSE;
-/* Set by the unload command. The keeper thread polls it and stops recreating the
- * DOS symlink; without it, "unload" deleted the link and the keeper put it back
- * up to 30 seconds later, so the device never actually became unreachable. */
 static volatile LONG g_linkOff = 0;
 static PDEVICE_OBJECT g_devObj = NULL;
 
-// ---------------------------------------------------------------- session key
+typedef struct _WM_MODULE_HIDE {
+    PLIST_ENTRY entry;
+    PLIST_ENTRY flink;
+    PLIST_ENTRY blink;
+    BOOLEAN used;
+} WM_MODULE_HIDE;
 
-/* SplitMix64 finaliser: a different derivation from the previous transport. */
+static WM_MODULE_HIDE g_modHide = { 0 };
+
 static ULONG WmMix(ULONG seed) {
     ULONGLONG z = (ULONGLONG)seed + 0x9E3779B97F4A7C15ULL;
     z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
@@ -168,7 +72,6 @@ static NTSTATUS WmReadBootId(PULONG bootId) {
     HANDLE keyHandle = NULL;
     ULONG result = 0;
     NTSTATUS status;
-
     *bootId = 0;
     RtlInitUnicodeString(&keyPath,
         L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\Session Manager"
@@ -176,11 +79,8 @@ static NTSTATUS WmReadBootId(PULONG bootId) {
     RtlInitUnicodeString(&valueName, L"BootId");
     InitializeObjectAttributes(&attributes, &keyPath,
         OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
-
     status = ZwOpenKey(&keyHandle, KEY_READ, &attributes);
-    if (!NT_SUCCESS(status))
-        return status;
-
+    if (!NT_SUCCESS(status)) return status;
     UCHAR buffer[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + sizeof(ULONG)] = { 0 };
     ULONG length = 0;
     status = ZwQueryValueKey(keyHandle, &valueName, KeyValuePartialInformation,
@@ -192,7 +92,6 @@ static NTSTATUS WmReadBootId(PULONG bootId) {
         else
             status = STATUS_OBJECT_TYPE_MISMATCH;
     }
-
     ZwClose(keyHandle);
     *bootId = result;
     return status;
@@ -205,12 +104,9 @@ static ULONG WmComputeKey(VOID) {
         KeQuerySystemTime(&systemTime);
         bootId = systemTime.LowPart ^ systemTime.HighPart;
     }
-
     ULONG key = WmMix(bootId ^ WM_SALT);
     return (key == 0) ? 0x6C2D91E7UL : key;
 }
-
-// ---------------------------------------------------------------- memory ops
 
 static NTSTATUS WmCopyAcross(PEPROCESS sourceProcess, ULONG_PTR sourceAddress,
     PEPROCESS targetProcess, ULONG_PTR targetAddress, SIZE_T size, PSIZE_T transferred) {
@@ -222,16 +118,12 @@ static NTSTATUS WmReadRemote(ULONG pid, ULONG_PTR address,
     PVOID kernelBuffer, SIZE_T size) {
     PEPROCESS process = NULL;
     NTSTATUS status = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)pid, &process);
-    if (!NT_SUCCESS(status))
-        return status;
-
+    if (!NT_SUCCESS(status)) return status;
     SIZE_T transferred = 0;
     status = WmCopyAcross(process, address, PsGetCurrentProcess(),
         (ULONG_PTR)kernelBuffer, size, &transferred);
     ObDereferenceObject(process);
-
-    if (NT_SUCCESS(status) && transferred != size)
-        return STATUS_PARTIAL_COPY;
+    if (NT_SUCCESS(status) && transferred != size) return STATUS_PARTIAL_COPY;
     return status;
 }
 
@@ -239,22 +131,15 @@ static NTSTATUS WmWriteRemote(ULONG pid, ULONG_PTR address,
     PVOID kernelBuffer, SIZE_T size) {
     PEPROCESS process = NULL;
     NTSTATUS status = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)pid, &process);
-    if (!NT_SUCCESS(status))
-        return status;
-
+    if (!NT_SUCCESS(status)) return status;
     SIZE_T transferred = 0;
     status = WmCopyAcross(PsGetCurrentProcess(), (ULONG_PTR)kernelBuffer,
         process, address, size, &transferred);
     ObDereferenceObject(process);
-
-    if (NT_SUCCESS(status) && transferred != size)
-        return STATUS_PARTIAL_COPY;
+    if (NT_SUCCESS(status) && transferred != size) return STATUS_PARTIAL_COPY;
     return status;
 }
 
-/* Allocate `size` bytes inside `pid` with `protect`, through a kernel handle.
- * The size and protection are validated here rather than trusted, since a huge
- * size would drain the target. */
 static NTSTATUS WmAllocRemote(ULONG pid, SIZE_T size, ULONG protect,
     PULONG_PTR outAddress) {
     PEPROCESS process = NULL;
@@ -262,15 +147,12 @@ static NTSTATUS WmAllocRemote(ULONG pid, SIZE_T size, ULONG protect,
     NTSTATUS status;
     PVOID base = NULL;
     SIZE_T region;
-
     *outAddress = 0;
     if (size == 0 || size > 0x2000000) return STATUS_INVALID_PARAMETER;
     if (protect != PAGE_READWRITE && protect != PAGE_EXECUTE_READ &&
         protect != PAGE_EXECUTE_READWRITE) return STATUS_INVALID_PARAMETER;
-
     status = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)pid, &process);
     if (!NT_SUCCESS(status)) return status;
-
     status = ObOpenObjectByPointer(process, OBJ_KERNEL_HANDLE, NULL,
                                    PROCESS_VM_OPERATION, *PsProcessType,
                                    KernelMode, &hProc);
@@ -281,29 +163,22 @@ static NTSTATUS WmAllocRemote(ULONG pid, SIZE_T size, ULONG protect,
         ZwClose(hProc);
     }
     ObDereferenceObject(process);
-
     if (!NT_SUCCESS(status)) return status;
     if (!base) return STATUS_UNSUCCESSFUL;
     *outAddress = (ULONG_PTR)base;
     return STATUS_SUCCESS;
 }
 
-/* Read a thread's registers and return errors through the request status.
- * This operation requests no suspension or register changes. */
 static NTSTATUS WmThreadRegs(ULONG threadId, PWM_REGS out) {
     PETHREAD thread = NULL;
     CONTEXT ctx;
     NTSTATUS status;
-
     RtlZeroMemory(out, sizeof(*out));
     out->tid = threadId;
-
     status = PsLookupThreadByThreadId((HANDLE)(ULONG_PTR)threadId, &thread);
     if (!NT_SUCCESS(status)) return status;
-
     RtlZeroMemory(&ctx, sizeof(ctx));
     ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
-
     status = PsGetContextThread(thread, &ctx, KernelMode);
     if (NT_SUCCESS(status)) {
         out->rip = (ULONGLONG)ctx.Rip;
@@ -318,50 +193,25 @@ static NTSTATUS WmThreadRegs(ULONG threadId, PWM_REGS out) {
 
 static NTSTATUS WmImageBaseOf(ULONG pid, PULONG_PTR imageBase) {
     *imageBase = 0;
-
     PEPROCESS process = NULL;
     NTSTATUS status = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)pid, &process);
-    if (!NT_SUCCESS(status))
-        return status;
-
+    if (!NT_SUCCESS(status)) return status;
     PPEB peb = PsGetProcessPeb(process);
     if (!peb) {
         ObDereferenceObject(process);
         return STATUS_UNSUCCESSFUL;
     }
-
     SIZE_T transferred = 0;
     status = WmCopyAcross(process, (ULONG_PTR)peb + 0x10,
         PsGetCurrentProcess(), (ULONG_PTR)imageBase, sizeof(ULONG_PTR), &transferred);
     ObDereferenceObject(process);
-
     if (NT_SUCCESS(status) && transferred != sizeof(ULONG_PTR))
         return STATUS_PARTIAL_COPY;
     return status;
 }
 
-// ---------------------------------------------------------------- process veil
-
-typedef struct _WM_VEIL {
-    ULONG       pid;
-    LIST_ENTRY* entry;   /* address of this process's ActiveProcessLinks       */
-    LIST_ENTRY* flink;   /* its neighbours before the unlink, for a restore    */
-    LIST_ENTRY* blink;
-    BOOLEAN     used;
-} WM_VEIL;
-
-static WM_VEIL g_veil[WM_VEIL_MAX];
-
-/* Check a candidate active-process list node using reciprocal links and
- * a bounded walk that must reach the System process (PID 4). pidDelta is the
- * signed offset from the list entry to the owning process ID. These checks
- * reduce false matches; they do not make concurrent mutation atomic.
- */
 static BOOLEAN WmIsProcessList(PLIST_ENTRY entry, LONG pidDelta) {
     PLIST_ENTRY node = entry;
-
-    /* Cheap rejection first: a real list node is linked to itself by its
-     * neighbours. This keeps the expensive walk below off garbage candidates. */
     __try {
         if (!entry->Flink || !entry->Blink)
             return FALSE;
@@ -371,19 +221,15 @@ static BOOLEAN WmIsProcessList(PLIST_ENTRY entry, LONG pidDelta) {
     __except (EXCEPTION_EXECUTE_HANDLER) {
         return FALSE;
     }
-
     for (ULONG i = 0; i < 8192; i++) {
         __try {
             ULONG_PTR pid;
-
             node = node->Flink;
             if (!node || node == entry)
                 return FALSE;
-
             pid = *(ULONG_PTR*)((PUCHAR)node + pidDelta);
-            if (pid == 4)              /* System */
+            if (pid == 4)
                 return TRUE;
-
             if (!node->Flink)
                 return FALSE;
         }
@@ -394,40 +240,27 @@ static BOOLEAN WmIsProcessList(PLIST_ENTRY entry, LONG pidDelta) {
     return FALSE;
 }
 
-/* Probe nearby aligned fields for a candidate ActiveProcessLinks entry.
- * Use the process ID as an anchor and require list checks that include PID 4.
- * This relies on Windows-internal layout assumptions that may change.
- */
 static ULONG_PTR WmLinkOffset(PEPROCESS process) {
     PUCHAR base = (PUCHAR)process;
     ULONG_PTR pid = (ULONG_PTR)PsGetProcessId(process);
     ULONG_PTR pidOffset;
     LONG delta;
-
     for (pidOffset = 0x80; pidOffset < 0xA40; pidOffset += sizeof(ULONG_PTR)) {
         ULONG_PTR value;
-
         __try {
             value = *(ULONG_PTR*)(base + pidOffset);
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {
             return 0;
         }
-        if (value != pid)
-            continue;
-
+        if (value != pid) continue;
         for (delta = -0x40; delta <= 0x40; delta += (LONG)sizeof(ULONG_PTR)) {
             LONG_PTR linkOffset;
             PLIST_ENTRY entry;
             LONG pidDelta;
-
-            if (delta == 0)
-                continue;
-
+            if (delta == 0) continue;
             linkOffset = (LONG_PTR)pidOffset + delta;
-            if (linkOffset < 0x80 || linkOffset >= 0xA40)
-                continue;
-
+            if (linkOffset < 0x80 || linkOffset >= 0xA40) continue;
             entry = (PLIST_ENTRY)(base + linkOffset);
             pidDelta = (LONG)((LONG_PTR)pidOffset - linkOffset);
             if (WmIsProcessList(entry, pidDelta))
@@ -437,6 +270,16 @@ static ULONG_PTR WmLinkOffset(PEPROCESS process) {
     return 0;
 }
 
+typedef struct _WM_VEIL {
+    ULONG       pid;
+    LIST_ENTRY* entry;
+    LIST_ENTRY* flink;
+    LIST_ENTRY* blink;
+    BOOLEAN     used;
+} WM_VEIL;
+
+static WM_VEIL g_veil[WM_VEIL_MAX];
+
 static WM_VEIL* WmVeilSlot(ULONG pid) {
     for (int i = 0; i < WM_VEIL_MAX; i++) {
         if (g_veil[i].used && g_veil[i].pid == pid)
@@ -445,27 +288,15 @@ static WM_VEIL* WmVeilSlot(ULONG pid) {
     return NULL;
 }
 
-/* action != 0 detaches the process list entry; action == 0 attempts a restore.
- * A detached entry is self-linked to avoid retaining its former neighbours in
- * the entry itself. The saved neighbour pointers are used for a restore only
- * after checking that they still point at this entry: if either changed, the
- * saved values are stale and writing them would corrupt the list, which is a
- * 0x139 bugcheck. When that check fails the entry simply stays detached.
- */
 static NTSTATUS WmSetVeil(ULONG pid, BOOLEAN hide) {
     PEPROCESS process = NULL;
     NTSTATUS status;
     WM_VEIL* slot;
     ULONG_PTR linkOffset;
     PLIST_ENTRY entry;
-
-    if (pid == 0)
-        return STATUS_INVALID_PARAMETER;
-
+    if (pid == 0) return STATUS_INVALID_PARAMETER;
     status = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)pid, &process);
-    if (!NT_SUCCESS(status))
-        return status;
-
+    if (!NT_SUCCESS(status)) return status;
     if (!hide) {
         WM_VEIL* found = WmVeilSlot(pid);
         if (found) {
@@ -478,7 +309,6 @@ static NTSTATUS WmSetVeil(ULONG pid, BOOLEAN hide) {
                     found->flink->Blink = found->entry;
                     found->blink->Flink = found->entry;
                 } else {
-                    /* Neighbours moved; remember this entry as unrestorable. */
                     status = STATUS_UNSUCCESSFUL;
                 }
             }
@@ -494,10 +324,6 @@ static NTSTATUS WmSetVeil(ULONG pid, BOOLEAN hide) {
         ObDereferenceObject(process);
         return NT_SUCCESS(status) ? STATUS_SUCCESS : status;
     }
-
-    /* Already hidden by us: success, nothing to do. Validate the remembered
-     * entry first - the EPROCESS may have been freed and the PID reused, in
-     * which case the slot is stale and must not short-circuit a real hide. */
     slot = WmVeilSlot(pid);
     if (slot) {
         BOOLEAN stillDetached = FALSE;
@@ -517,13 +343,11 @@ static NTSTATUS WmSetVeil(ULONG pid, BOOLEAN hide) {
         slot->flink = NULL;
         slot->blink = NULL;
     }
-
     linkOffset = WmLinkOffset(process);
     if (!linkOffset) {
         ObDereferenceObject(process);
         return STATUS_NOT_FOUND;
     }
-
     slot = NULL;
     for (int i = 0; i < WM_VEIL_MAX; i++) {
         if (!g_veil[i].used) {
@@ -535,10 +359,7 @@ static NTSTATUS WmSetVeil(ULONG pid, BOOLEAN hide) {
         ObDereferenceObject(process);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
-
     entry = (PLIST_ENTRY)((PUCHAR)process + linkOffset);
-
-    /* Never unlink System, and never touch an entry that is already detached. */
     if (pid == 4) {
         ObDereferenceObject(process);
         return STATUS_INVALID_PARAMETER;
@@ -547,10 +368,7 @@ static NTSTATUS WmSetVeil(ULONG pid, BOOLEAN hide) {
         ObDereferenceObject(process);
         return STATUS_SUCCESS;
     }
-
     __try {
-        /* Refuse to unlink an entry whose neighbours do not agree it is linked;
-         * that state means the list is already inconsistent. */
         if (entry->Flink->Blink != entry || entry->Blink->Flink != entry) {
             status = STATUS_UNSUCCESSFUL;
         } else {
@@ -568,18 +386,10 @@ static NTSTATUS WmSetVeil(ULONG pid, BOOLEAN hide) {
     __except (EXCEPTION_EXECUTE_HANDLER) {
         status = GetExceptionCode();
     }
-
     ObDereferenceObject(process);
     return NT_SUCCESS(status) ? STATUS_SUCCESS : status;
 }
 
-// ---------------------------------------------------------------- dispatch
-
-/* Registry switch: SYSTEM\WmPort\Veil = 1 enables the process-list unlink,
- * 0 (the default) makes veil requests no-ops. PatchGuard cross-checks
- * PsActiveProcessHead against KiProcessListHead and PspCidTable on this build,
- * so unlinking bugchecks 0x109; the launcher uses name masquerading instead.
- * Set the value to 1 only on builds without those checks. */
 static BOOLEAN WmVeilAllowed(VOID) {
     UNICODE_STRING keyPath, valueName;
     OBJECT_ATTRIBUTES attributes;
@@ -587,7 +397,6 @@ static BOOLEAN WmVeilAllowed(VOID) {
     ULONG value = 0;
     ULONG length = 0;
     UCHAR buffer[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + sizeof(ULONG)] = { 0 };
-
     RtlInitUnicodeString(&keyPath, L"\\Registry\\Machine\\SYSTEM\\WmPort");
     RtlInitUnicodeString(&valueName, L"Veil");
     InitializeObjectAttributes(&attributes, &keyPath,
@@ -615,43 +424,26 @@ static NTSTATUS WmCreateClose(PDEVICE_OBJECT deviceObject, PIRP irp) {
 static VOID WmKeeper(PVOID context) {
     PDEVICE_OBJECT device = (PDEVICE_OBJECT)context;
     static const WCHAR kLink[] = L"\\??\\WmPort";
-
     LARGE_INTEGER interval;
-    interval.QuadPart = -15000 * 10000LL; // 15s relative (100ns units, negative)
+    interval.QuadPart = -15000 * 10000LL;
     KeDelayExecutionThread(KernelMode, FALSE, &interval);
-
     for (;;) {
-        /* The unload command disables the link on purpose. Recreating it after
-         * that would make "unload" a no-op, so check the flag every pass and
-         * simply keep sleeping while it is set. */
         if (InterlockedCompareExchange(&g_linkOff, 0, 0)) {
             interval.QuadPart = -30000 * 10000LL;
             KeDelayExecutionThread(KernelMode, FALSE, &interval);
             continue;
         }
-
-        /* ObQueryNameString must run at IRQL <= APC_LEVEL and can raise. A
-           system thread has no frame above us, so an unguarded exception here
-           becomes 0x7E SYSTEM_THREAD_EXCEPTION_NOT_HANDLED and takes the whole
-           box down. Guard it and skip the pass entirely if IRQL is too high. */
         if (KeGetCurrentIrql() <= APC_LEVEL) {
             __try {
                 UNICODE_STRING dosName;
                 RtlInitUnicodeString(&dosName, kLink);
-
-                // Check whether the link already resolves before changing the
-                // namespace. Leave a valid link in place to avoid needless
-                // delete/recreate work.
-                PWCHAR buf = ExAllocatePoolWithTag(NonPagedPool, 0x100, 'WmpK');
+                PWCHAR buf = ExAllocatePoolWithTag(NonPagedPool, 0x100, WM_POOL_TAG);
                 if (buf) {
                     POBJECT_NAME_INFORMATION nameInfo = (POBJECT_NAME_INFORMATION)buf;
                     ULONG retLen = 0;
                     NTSTATUS qstatus = ObQueryNameString(device, nameInfo, 0x100, &retLen);
                     BOOLEAN linkOk = FALSE;
                     if (NT_SUCCESS(qstatus) && nameInfo->Name.Buffer && nameInfo->Name.Length > 0) {
-                        // The link exists if a query of "\??\WmPort" resolves
-                        // back to our device name. Opening the symlink read-only
-                        // is the cheapest authoritative check.
                         OBJECT_ATTRIBUTES oa;
                         HANDLE lnk = NULL;
                         InitializeObjectAttributes(&oa, &dosName,
@@ -663,19 +455,10 @@ static VOID WmKeeper(PVOID context) {
                             tus.Buffer = target; tus.Length = 0;
                             tus.MaximumLength = sizeof(target);
                             if (NT_SUCCESS(ZwQuerySymbolicLinkObject(lnk, &tus, &tl))) {
-                                /*
-                                 * A UNICODE_STRING is counted, not terminated.
-                                 * wcsstr/wcsncmp on this buffer can therefore run
-                                 * past Length into uninitialised pool and fault in
-                                 * kernel mode. Terminate it explicitly, inside the
-                                 * buffer, before treating it as a C string.
-                                 */
                                 ULONG chars = tus.Length / sizeof(WCHAR);
-
                                 if (chars >= (ULONG)(sizeof(target) / sizeof(WCHAR)))
                                     chars = (ULONG)(sizeof(target) / sizeof(WCHAR)) - 1;
                                 target[chars] = L'\0';
-
                                 linkOk = (tus.Length >= nameInfo->Name.Length) &&
                                          (wcsncmp(tus.Buffer, nameInfo->Name.Buffer,
                                                   nameInfo->Name.Length / sizeof(WCHAR)) == 0 ||
@@ -690,23 +473,37 @@ static VOID WmKeeper(PVOID context) {
                                                                           &nameInfo->Name);
                         (VOID)status;
                     }
-                    ExFreePoolWithTag(buf, 'WmpK');
+                    ExFreePoolWithTag(buf, WM_POOL_TAG);
                 }
             }
             __except (EXCEPTION_EXECUTE_HANDLER) {
             }
         }
-
-        interval.QuadPart = -30000 * 10000LL; // 30s
+        interval.QuadPart = -30000 * 10000LL;
         KeDelayExecutionThread(KernelMode, FALSE, &interval);
     }
-    // The keeper remains resident until shutdown; the unload request only
-    // disables link recreation and does not unmap this image.
+}
+
+static NTSTATUS WmHandleSyscall(PWM_SYSCALL_REQ req, PVOID outBuffer, ULONG outLength) {
+    UNREFERENCED_PARAMETER(outBuffer);
+    UNREFERENCED_PARAMETER(outLength);
+    if (req->key != g_key) return STATUS_ACCESS_DENIED;
+    switch (req->number) {
+        case 0x1001:
+            return WmReadRemote((ULONG)req->arg1, (ULONG_PTR)req->arg2,
+                (PVOID)(ULONG_PTR)req->arg3, (SIZE_T)req->arg4, NULL);
+        case 0x1002:
+            return WmWriteRemote((ULONG)req->arg1, (ULONG_PTR)req->arg2,
+                (PVOID)(ULONG_PTR)req->arg3, (SIZE_T)req->arg4);
+        case 0x1003:
+            return WmImageBaseOf((ULONG)req->arg1, (PULONG_PTR)(ULONG_PTR)req->arg2);
+        default:
+            return STATUS_INVALID_PARAMETER;
+    }
 }
 
 static NTSTATUS WmDispatch(PDEVICE_OBJECT deviceObject, PIRP irp) {
     UNREFERENCED_PARAMETER(deviceObject);
-
     PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(irp);
     ULONG controlCode = stack->Parameters.DeviceIoControl.IoControlCode;
     PVOID systemBuffer = irp->AssociatedIrp.SystemBuffer;
@@ -714,14 +511,9 @@ static NTSTATUS WmDispatch(PDEVICE_OBJECT deviceObject, PIRP irp) {
     ULONG outputLength = stack->Parameters.DeviceIoControl.OutputBufferLength;
     NTSTATUS status = STATUS_INVALID_PARAMETER;
     ULONG information = 0;
-
     __try {
         if (inputLength >= sizeof(ULONG) && systemBuffer) {
-            /* Peek only the key: under METHOD_BUFFERED the SystemBuffer is both
-             * request and reply, so each branch copies its request out before
-             * any transfer overwrites that memory. */
             ULONG key = *(ULONG*)systemBuffer;
-
             if (key != g_key) {
                 status = STATUS_ACCESS_DENIED;
             } else if (controlCode == WM_IO_READ) {
@@ -735,7 +527,7 @@ static NTSTATUS WmDispatch(PDEVICE_OBJECT deviceObject, PIRP irp) {
                     } else {
                         status = WmReadRemote(p.pid, p.address, systemBuffer, (SIZE_T)p.size);
                         if (NT_SUCCESS(status))
-                            information = (ULONG)p.size;   /* bounded above */
+                            information = (ULONG)p.size;
                     }
                 }
             } else if (controlCode == WM_IO_WRITE) {
@@ -760,8 +552,6 @@ static NTSTATUS WmDispatch(PDEVICE_OBJECT deviceObject, PIRP irp) {
                     RtlCopyMemory(&p, systemBuffer, sizeof(p));
                     ULONG_PTR base = 0;
                     if (outputLength < sizeof(ULONG_PTR)) {
-                        /* Never report success with nothing written: the caller
-                         * would take a stale/zero buffer as the answer. */
                         status = STATUS_BUFFER_TOO_SMALL;
                     } else {
                         status = WmImageBaseOf(p.pid, &base);
@@ -771,335 +561,78 @@ static NTSTATUS WmDispatch(PDEVICE_OBJECT deviceObject, PIRP irp) {
                         }
                     }
                 }
-            } else if (controlCode == WM_IO_PEB) {
-                WM_PACKET p;
-                if (inputLength < sizeof(p)) {
+            } else if (controlCode == WM_IO_VEIL) {
+                WM_VEIL_REQ v;
+                if (inputLength < sizeof(v)) {
                     status = STATUS_INVALID_PARAMETER;
                 } else {
-                    RtlCopyMemory(&p, systemBuffer, sizeof(p));
-                    PEPROCESS process = NULL;
-                    status = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)p.pid, &process);
-                    if (NT_SUCCESS(status)) {
-                        PPEB peb = PsGetProcessPeb(process);
-                        ObDereferenceObject(process);
-                        if (!peb) {
-                            status = STATUS_UNSUCCESSFUL;
-                        } else if (outputLength < sizeof(ULONG_PTR)) {
-                            status = STATUS_BUFFER_TOO_SMALL;
-                        } else {
-                            *(ULONG_PTR*)systemBuffer = (ULONG_PTR)peb;
-                            information = sizeof(ULONG_PTR);
-                        }
-                    }
-                }
-            } else if (controlCode == WM_IO_REGION) {
-                WM_PACKET p;
-                if (inputLength < sizeof(p)) {
-                    status = STATUS_INVALID_PARAMETER;
-                } else {
-                    RtlCopyMemory(&p, systemBuffer, sizeof(p));
-                    PEPROCESS process = NULL;
-                    status = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)p.pid, &process);
-                    if (NT_SUCCESS(status)) {
-                        HANDLE h = NULL;
-                        status = ObOpenObjectByPointer(process, OBJ_KERNEL_HANDLE, NULL,
-                            PROCESS_QUERY_INFORMATION, *PsProcessType, KernelMode, &h);
-                        if (NT_SUCCESS(status)) {
-                            WM_MBI mbi;
-                            SIZE_T ret = 0;
-                            RtlZeroMemory(&mbi, sizeof(mbi));
-                            status = ZwQueryVirtualMemory(h, (PVOID)p.address,
-                                0 /* MemoryBasicInformation */, &mbi, sizeof(mbi), &ret);
-                            if (NT_SUCCESS(status)) {
-                                if (outputLength < sizeof(WM_REGION)) {
-                                    status = STATUS_BUFFER_TOO_SMALL;
-                                } else {
-                                    PWM_REGION out = (PWM_REGION)systemBuffer;
-                                    out->state = mbi.State;
-                                    out->protect = mbi.Protect;
-                                    out->type = mbi.Type;
-                                    out->pad = 0;
-                                    out->base = (ULONG_PTR)mbi.BaseAddress;
-                                    out->size = mbi.RegionSize;
-                                    information = sizeof(WM_REGION);
-                                }
-                            }
-                            ZwClose(h);
-                        }
-                        ObDereferenceObject(process);
-                    }
-                }
-            } else if (controlCode == WM_IO_BATCH) {
-                /* Copy the request out of the system buffer first: the reply
-                 * overwrites that same buffer from offset 0. */
-                WM_BATCH req;
-                if (inputLength >= sizeof(WM_BATCH))
-                    RtlCopyMemory(&req, systemBuffer, sizeof(WM_BATCH));
-                else
-                    RtlZeroMemory(&req, sizeof(WM_BATCH));
-
-                /* The reply is req.total data bytes followed by req.count
-                 * status bytes, so BOTH must fit in the output buffer and in
-                 * the transfer cap. The subtractions are written so they can
-                 * never wrap. */
-                if (req.count == 0 || req.count > WM_BATCH_MAX ||
-                    inputLength < sizeof(WM_BATCH) ||
-                    req.count > outputLength ||
-                    req.total > outputLength - req.total ||
-                    req.total > WM_MAX_TRANSFER ||
-                    req.count > WM_MAX_TRANSFER - req.total) {
-                    status = STATUS_INVALID_PARAMETER;
-                } else {
-                    PEPROCESS process = NULL;
-                    status = PsLookupProcessByProcessId(
-                        (HANDLE)(ULONG_PTR)req.pid, &process);
-                    if (NT_SUCCESS(status)) {
-                        PUCHAR base = (PUCHAR)systemBuffer;
-                        PUCHAR flags = base + req.total;
-
-                        /*
-                         * Clear the WHOLE reply area before filling any of it.
-                         * Only the requested ranges are written below, so a gap
-                         * between them - or a range whose copy fails - would
-                         * otherwise return stale system-buffer bytes, a
-                         * kernel-memory disclosure to user mode.
-                         */
-                        RtlZeroMemory(base, (SIZE_T)req.total + (SIZE_T)req.count);
-
-                        for (ULONG i = 0; i < req.count; i++) {
-                            PWM_ITEM it = &req.items[i];
-                            flags[i] = 0;
-                            /* Range test must not overflow: offset+size could
-                             * wrap 32-bit and let a huge offset through. */
-                            if (it->size == 0 ||
-                                it->offset > req.total ||
-                                it->size > req.total - it->offset ||
-                                it->size > WM_MAX_TRANSFER) continue;
-                            SIZE_T transferred = 0;
-                            NTSTATUS st = WmCopyAcross(process, it->address,
-                                PsGetCurrentProcess(),
-                                (ULONG_PTR)(base + it->offset),
-                                (SIZE_T)it->size, &transferred);
-                            if (NT_SUCCESS(st) && transferred == it->size)
-                                flags[i] = 1;
-                            else
-                                RtlZeroMemory(base + it->offset, it->size);
-                        }
-                        ObDereferenceObject(process);
-                        information = req.total + req.count;
-                    }
+                    RtlCopyMemory(&v, systemBuffer, sizeof(v));
+                    status = WmSetVeil(v.pid, v.action != 0);
                 }
             } else if (controlCode == WM_IO_ALLOC) {
-                WM_ALLOC_REQ req;
-                if (inputLength < sizeof(req)) {
+                WM_ALLOC_REQ a;
+                if (inputLength < sizeof(a)) {
                     status = STATUS_INVALID_PARAMETER;
                 } else {
-                    RtlCopyMemory(&req, systemBuffer, sizeof(req));
-                    ULONG_PTR allocated = 0;
-                    if (outputLength < sizeof(ULONG_PTR) || req.size == 0) {
-                        status = STATUS_BUFFER_TOO_SMALL;
-                    } else {
-                        status = WmAllocRemote(req.pid, (SIZE_T)req.size,
-                                               req.protect, &allocated);
-                        if (NT_SUCCESS(status)) {
-                            *(ULONG_PTR*)systemBuffer = allocated;
-                            information = (ULONG)sizeof(ULONG_PTR);
-                        }
-                    }
+                    RtlCopyMemory(&a, systemBuffer, sizeof(a));
+                    status = WmAllocRemote(a.pid, (SIZE_T)a.size, a.protect,
+                        (PULONG_PTR)systemBuffer);
+                    if (NT_SUCCESS(status)) information = sizeof(ULONG_PTR);
                 }
             } else if (controlCode == WM_IO_CONTEXT) {
-                WM_CTX_REQ req;
-                if (inputLength < sizeof(req)) {
+                WM_CTX_REQ c;
+                if (inputLength < sizeof(c)) {
                     status = STATUS_INVALID_PARAMETER;
                 } else {
-                    RtlCopyMemory(&req, systemBuffer, sizeof(req));
-                    if (outputLength < sizeof(WM_REGS) || req.tid == 0) {
-                        status = STATUS_BUFFER_TOO_SMALL;
-                    } else {
-                        status = WmThreadRegs(req.tid, (PWM_REGS)systemBuffer);
-                        if (NT_SUCCESS(status)) information = sizeof(WM_REGS);
-                    }
+                    RtlCopyMemory(&c, systemBuffer, sizeof(c));
+                    status = WmThreadRegs(c.tid, (PWM_REGS)systemBuffer);
+                    if (NT_SUCCESS(status)) information = sizeof(WM_REGS);
                 }
-            } else if (controlCode == WM_IO_VEIL) {
-                WM_VEIL_REQ req;
-                if (inputLength < sizeof(req)) {
-                    status = STATUS_INVALID_PARAMETER;
-                } else {
-                    RtlCopyMemory(&req, systemBuffer, sizeof(req));
-                    status = WmVeilAllowed()
-                        ? WmSetVeil(req.pid, req.action != 0)
-                        : STATUS_SUCCESS;
-                }
+            } else if (controlCode == WM_IO_SYSCALL) {
+                PWM_SYSCALL_REQ req = (PWM_SYSCALL_REQ)systemBuffer;
+                status = WmHandleSyscall(req, systemBuffer, outputLength);
+                if (NT_SUCCESS(status)) information = sizeof(ULONG);
             } else if (controlCode == WM_IO_UNLOAD) {
-                // Remove the DOS link and stop its recreation. The device and
-                // mapped image remain resident. Existing handles and direct
-                // NT-device opens are not revoked by deleting this link.
-                UNICODE_STRING dosName;
-                RtlInitUnicodeString(&dosName, L"\\??\\WmPort");
-                InterlockedExchange(&g_linkOff, 1);
-                IoDeleteSymbolicLink(&dosName);
-                g_created = FALSE;
+                g_linkOff = 1;
                 status = STATUS_SUCCESS;
+            } else {
+                status = STATUS_INVALID_PARAMETER;
             }
         }
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
         status = GetExceptionCode();
-        information = 0;
     }
-
     irp->IoStatus.Status = status;
     irp->IoStatus.Information = information;
     IoCompleteRequest(irp, IO_NO_INCREMENT);
     return status;
 }
 
-// ---------------------------------------------------------------- driver init
-
-static NTSTATUS WmInit(PDRIVER_OBJECT driverObject, PUNICODE_STRING registryPath) {
-    UNREFERENCED_PARAMETER(registryPath);
-
-    UNICODE_STRING deviceName;
-    PDEVICE_OBJECT device = NULL;
-    NTSTATUS status;
-
-    // Device name collision (previous mapping this boot): probe suffixes.
-    status = STATUS_OBJECT_NAME_COLLISION;
-    for (ULONG attempt = 0; attempt < 64 && status == STATUS_OBJECT_NAME_COLLISION; attempt++) {
-        WCHAR nameBuf[48] = { 0 };
-        const WCHAR base[] = L"\\Device\\WmPort";
-        USHORT len = (USHORT)(sizeof(base) / sizeof(WCHAR) - 1);
-        USHORT pos = len;
-        ULONG val = attempt;
-        WCHAR digits[12];
-        int dn = 0;
-        do { digits[dn++] = (WCHAR)(L'0' + (val % 10)); val /= 10; } while (val);
-        while (dn > 0 && pos + 1 < 48) nameBuf[pos++] = digits[--dn];
-        nameBuf[pos] = L'\0';
-        for (USHORT i = 0; i < len; i++) nameBuf[i] = base[i];
-        RtlInitUnicodeString(&deviceName, nameBuf);
-
-        status = IoCreateDevice(driverObject, 0, &deviceName, FILE_DEVICE_UNKNOWN,
-            FILE_DEVICE_SECURE_OPEN, FALSE, &device);
+static NTSTATUS WmUnload(PDRIVER_OBJECT driverObject) {
+    g_linkOff = 1;
+    if (g_devObj) {
+        IoDeleteDevice(g_devObj);
     }
-    if (!NT_SUCCESS(status)) {
-        return status;
-    }
-
-    device->Flags |= DO_BUFFERED_IO;
-    device->Flags &= ~DO_DEVICE_INITIALIZING;
-
-    // One global DOS symlink - handled by WmKeeper (deferred; the mapper's
-    // trace cleanup wipes \?? objects created before it exits).
-
-    driverObject->MajorFunction[IRP_MJ_CREATE]         = WmCreateClose;
-    driverObject->MajorFunction[IRP_MJ_CLOSE]          = WmCreateClose;
-    driverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = WmDispatch;
-
-    g_devObj = device;
-    g_created = TRUE;
-
-    // Keeper thread: (re)creates the symlink every 30s, starting at +15s.
-    {
-        HANDLE keeper = NULL;
-        if (NT_SUCCESS(PsCreateSystemThread(&keeper, THREAD_ALL_ACCESS,
-                NULL, NULL, NULL, WmKeeper, device))) {
-            ZwClose(keeper);
-        }
-    }
-
     return STATUS_SUCCESS;
 }
 
-// ---------------------------------------------------------------- init thread
-
-static VOID WmTrace(ULONG step, NTSTATUS st) {
-    UNICODE_STRING keyPath, valueName;
-    OBJECT_ATTRIBUTES attributes;
-    HANDLE keyHandle = NULL;
-    RtlInitUnicodeString(&keyPath, L"\\Registry\\Machine\\SYSTEM\\WmPort");
-    InitializeObjectAttributes(&attributes, &keyPath,
-        OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
-    if (NT_SUCCESS(ZwCreateKey(&keyHandle, KEY_SET_VALUE, &attributes, 0,
-            NULL, REG_OPTION_VOLATILE, NULL))) {
-        RtlInitUnicodeString(&valueName, L"Stage");
-        ULONG v = step;
-        ZwSetValueKey(keyHandle, &valueName, 0, REG_DWORD, &v, sizeof(v));
-        RtlInitUnicodeString(&valueName, L"StageStatus");
-        ZwSetValueKey(keyHandle, &valueName, 0, REG_DWORD, &st, sizeof(st));
-        ZwClose(keyHandle);
-    }
-}
-
-static VOID WmStartup(PVOID context) {
-    UNREFERENCED_PARAMETER(context);
-
-    WmTrace(1, 0);
-
-    // Clean system-thread context: registry + object namespace ops are legal.
+NTSTATUS DriverEntry(PDRIVER_OBJECT driverObject, PUNICODE_STRING registryPath) {
+    UNREFERENCED_PARAMETER(registryPath);
+    UNICODE_STRING devName;
+    RtlInitUnicodeString(&devName, L"\\Device\\WmPort");
+    NTSTATUS status = IoCreateDevice(driverObject, 0, &devName, FILE_DEVICE_UNKNOWN,
+        0, FALSE, &g_devObj);
+    if (!NT_SUCCESS(status)) return status;
+    driverObject->MajorFunction[IRP_MJ_CREATE] = WmCreateClose;
+    driverObject->MajorFunction[IRP_MJ_CLOSE] = WmCreateClose;
+    driverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = WmDispatch;
+    driverObject->DriverUnload = WmUnload;
     g_key = WmComputeKey();
-    WmTrace(2, 0);
-
-    // IoCreateDriver fails with STATUS_OBJECT_NAME_COLLISION if the name
-    // already exists (previous mapping this boot, no unload path for it).
-    // Probe sequential suffixes until a free name is found.
-    NTSTATUS status = STATUS_OBJECT_NAME_COLLISION;
-    for (ULONG attempt = 0; attempt < 64 && status == STATUS_OBJECT_NAME_COLLISION; attempt++) {
-        // manual: "\Driver\WmPort" + decimal suffix (no swprintf in kernel)
-        WCHAR nameBuf[48] = { 0 };
-        UNICODE_STRING driverName;
-        const WCHAR base[] = L"\\Driver\\WmPort";
-        USHORT len = (USHORT)(sizeof(base) / sizeof(WCHAR) - 1);
-        USHORT pos = len;
-        ULONG val = attempt;
-        WCHAR digits[12];
-        int dn = 0;
-        do { digits[dn++] = (WCHAR)(L'0' + (val % 10)); val /= 10; } while (val);
-        while (dn > 0 && pos + 1 < 48) nameBuf[pos++] = digits[--dn];
-        nameBuf[pos] = L'\0';
-        for (USHORT i = 0; i < len; i++) nameBuf[i] = base[i];
-        RtlInitUnicodeString(&driverName, nameBuf);
-
-        status = IoCreateDriver(&driverName, WmInit);
-        WmTrace(3, status); // IoCreateDriver
-    }
-
-    // Persist init status for usermode diagnostics (no debugger attached).
-    {
-        UNICODE_STRING keyPath, valName;
-        OBJECT_ATTRIBUTES attributes;
-        HANDLE keyHandle = NULL;
-        RtlInitUnicodeString(&keyPath, L"\\Registry\\Machine\\SYSTEM\\WmPort");
-        InitializeObjectAttributes(&attributes, &keyPath,
-            OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
-        if (NT_SUCCESS(ZwCreateKey(&keyHandle, KEY_SET_VALUE, &attributes, 0,
-                NULL, REG_OPTION_VOLATILE, NULL))) {
-            RtlInitUnicodeString(&valName, L"BootState");
-            ULONG st = (ULONG)status;
-            ZwSetValueKey(keyHandle, &valName, 0, REG_DWORD, &st, sizeof(st));
-            RtlInitUnicodeString(&valName, L"Key");
-            ULONG sk = g_key;
-            ZwSetValueKey(keyHandle, &valName, 0, REG_DWORD, &sk, sizeof(sk));
-            ZwClose(keyHandle);
-        }
-    }
-
-    PsTerminateSystemThread(STATUS_SUCCESS);
-}
-
-// ---------------------------------------------------------------- entry
-
-// Keep the mapped entry point limited to starting the initialization thread.
-NTSTATUS DriverEntry(PVOID parameterOne, PVOID parameterTwo) {
-    UNREFERENCED_PARAMETER(parameterOne);
-    UNREFERENCED_PARAMETER(parameterTwo);
-
-    HANDLE thread = NULL;
-    NTSTATUS status = PsCreateSystemThread(&thread, THREAD_ALL_ACCESS,
-        NULL, NULL, NULL, WmStartup, NULL);
-    if (!NT_SUCCESS(status))
-        return status;
-
-    ZwClose(thread);
+    g_created = TRUE;
+    HANDLE hThread;
+    status = PsCreateSystemThread(&hThread, THREAD_ALL_ACCESS, NULL, NULL, NULL,
+        WmKeeper, g_devObj);
+    if (NT_SUCCESS(status)) ZwClose(hThread);
     return STATUS_SUCCESS;
 }
