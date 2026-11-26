@@ -99,17 +99,52 @@ Example:
 mapper.exe ..\driver\driver.sys 0xFFFFF80000000000
 ```
 
+### Implementation status
+
+The mapper is implemented in 6 steps. All are present in `mapper/main.cpp`
+but several require a kernel execution primitive (the ability to run shellcode
+in kernel context) that `\\.\PhysicalMemory` read/write alone does not provide.
+
+| Step | Feature | Status | Requires execution primitive? |
+|---|---|---|---|
+| 1 | `IMAGE_EXPORT_DIRECTORY` struct definition | ✅ Implemented | No |
+| 2 | Automatic ntoskrnl base detection via `NtQuerySystemInformation(SystemModuleInformation)` | ✅ Implemented | No |
+| 3 | Kernel pool allocation via `ExAllocatePoolWithTag` shellcode stub | ✅ Implemented | Yes |
+| 4 | Section copying, base relocation (`IMAGE_REL_BASED_DIR64`), import resolution | ✅ Implemented | No (uses RW only) |
+| 5 | DriverEntry invocation via x64 shellcode stub | ✅ Implemented | Yes |
+| 6 | `PsLoadedModuleList` pattern scan + DKOM unlinking | ✅ Implemented | Yes (for unlink writes) |
+
 ### Mapping flow
 
 1. Initialize `\\.\PhysicalMemory` handle (requires admin + SeDebugPrivilege)
-2. Read `driver.sys` PE image locally
-3. Resolve `ntoskrnl.exe` base (pass as argument or auto-detect)
-4. Resolve `ExAllocatePoolWithTag` export from kernel
-5. Allocate executable non-paged kernel pool
-6. Copy driver sections, fix relocations, resolve imports
-7. Call `DriverEntry` via shellcode stub
-8. Unlink driver from `PsLoadedModuleList` (DKOM)
-9. User-mode loader communicates via `WM_IO_SYSCALL` or new IOCTL codes
+2. Read `driver.sys` PE image locally and validate DOS/NT headers
+3. Resolve `ntoskrnl.exe` base (command-line argument or auto-detect via `NtQuerySystemInformation`)
+4. Resolve `ExAllocatePoolWithTag` export from the kernel's ntoskrnl image
+5. Allocate executable non-paged kernel pool via shellcode stub calling `ExAllocatePoolWithTag`
+6. Copy driver PE sections into allocated kernel memory at `kernelBase + section->VirtualAddress`
+7. Apply base relocations (`IMAGE_REL_BASED_DIR64`) using delta = `kernelBase - ImageBase`
+8. Resolve imports by walking the import directory and looking up exported function names
+9. Invoke `DriverEntry` at `kernelBase + AddressOfEntryPoint` via x64 shellcode stub
+10. Pattern-scan ntoskrnl `.text` for `PsLoadedModuleList` (a global, not an export)
+11. Walk `PsLoadedModuleList` to find the driver's `LDR_DATA_TABLE_ENTRY` by matching `DllBase`
+12. DKOM unlink: `Flink->Blink = Blink`, `Blink->Flink = Flink`
+13. User-mode loader communicates via `WM_IO_SYSCALL` or new IOCTL codes
+
+### EAC-evasion features
+
+- No vulnerable signed driver (no `intel_driver` BYOVD)
+- Direct `\\.\PhysicalMemory` access instead of a signed vulnerable driver
+- Custom IOCTL codes (changed from old KdMapper IOCTLs)
+- `PsLoadedModuleList` DKOM unlinking to hide the mapped driver from EAC's module list scans
+- Module-list unlinking removes the driver from `PsLoadedModuleList`, `PsLoadedModuleList` in-memory order, and initialization order chains
+- Trace/visibility cleanup via syscall channel instead of standard IOCTL paths
+
+### Current limitations
+
+- `\\.\PhysicalMemory` provides kernel read/write but **not** direct kernel execution. Steps 3, 5, and 6 require the driver's IOCTL to copy and execute shellcode in kernel context. These are currently framework placeholders that log the intended addresses.
+- `PsLoadedModuleList` is a global symbol, not an export, so it is located via `.text` pattern scanning (`lea rax, [rip+disp]` heuristic) rather than export resolution.
+- `resolve_kernel_export()` requires a module base; cross-DLL imports (imports from modules other than ntoskrnl) are flagged as needing cross-module resolution.
+- `IMAGE_REL_BASED_DIR64` relocations are supported; other relocation types are not yet handled.
 
 ## How one frame works
 
