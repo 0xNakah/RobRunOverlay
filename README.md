@@ -23,7 +23,8 @@ for the move map and migration steps.
 | `artifacts/run/` | Prebuilt artifacts, settings and launch scripts |
 | `overlay/` | Overlay, reader, renderer, menu and build script |
 | `driver/` | WmPort kernel driver and its build script |
-| `mapper-analysis/kd2_src/` | Old mapper solution and source, preserved unchanged for study; no operational replacement is maintained |
+| `mapper/` | Custom EAC-hardened kernel driver mapper (replaces old KdMapper BYOVD) |
+| `mapper-analysis/kd2_src/` | Old mapper solution and source, preserved unchanged for study; replaced by `mapper/` |
 | `launcher/` | AIO launcher solution and source |
 | `data/offsets/` | Managed field definitions and rig provenance in JSON |
 | `scripts/` | Offset generation and auditing scripts |
@@ -57,9 +58,58 @@ earlier builds. Rebuilding is how to validate the source you are studying.
 7. Read `WinMain`, `ReadThread`, `RenderThread` and `OverlayProc` in
    [rr_esp.c](overlay/rr_esp.c) to see how the pieces are scheduled.
 8. Study [wm_drv.c](driver/wm_drv.c) with its wire contract in
-   [wm.h](driver/wm.h), then the mapper under `mapper-analysis/`, after
+   [wm.h](driver/wm.h), then the custom mapper under `mapper/`, after
    understanding the user-mode contracts. Their source is separate from the
    offline lessons.
+
+## Custom mapper (`mapper/`)
+
+The old KdMapper-style mapper used a vulnerable signed Intel driver
+(`intel_driver::load()`) which EAC detects via certificate revocation and
+BYOVD signature scanning. The new mapper under `mapper/` uses `\\.\PhysicalMemory`
+for direct kernel memory access — no vulnerable signed driver is involved.
+
+### Files
+
+| File | Purpose |
+|---|---|
+| `mapper/primitive.h` | Kernel read/write primitive interface |
+| `mapper/physical_memory.cpp` | `\\.\PhysicalMemory` implementation with SeDebugPrivilege |
+| `mapper/main.cpp` | Mapper entry point: PE parsing, export resolution, driver mapping |
+| `mapper/build_mapper.bat` | MSVC build script producing `mapper.exe` |
+
+### Build
+
+```bat
+cd mapper
+build_mapper.bat
+```
+
+This produces `mapper.exe`. Run as administrator (requires `SeDebugPrivilege`
+for `\\.\PhysicalMemory`).
+
+### Usage
+
+```bat
+mapper.exe driver.sys [ntoskrnl_base_hex]
+```
+
+Example:
+```bat
+mapper.exe ..\driver\driver.sys 0xFFFFF80000000000
+```
+
+### Mapping flow
+
+1. Initialize `\\.\PhysicalMemory` handle (requires admin + SeDebugPrivilege)
+2. Read `driver.sys` PE image locally
+3. Resolve `ntoskrnl.exe` base (pass as argument or auto-detect)
+4. Resolve `ExAllocatePoolWithTag` export from kernel
+5. Allocate executable non-paged kernel pool
+6. Copy driver sections, fix relocations, resolve imports
+7. Call `DriverEntry` via shellcode stub
+8. Unlink driver from `PsLoadedModuleList` (DKOM)
+9. User-mode loader communicates via `WM_IO_SYSCALL` or new IOCTL codes
 
 ## How one frame works
 
