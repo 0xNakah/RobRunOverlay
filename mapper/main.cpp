@@ -1,17 +1,8 @@
-/* mapper/main.cpp - Custom EAC-hardened kernel driver mapper.
- *
- * Replaces the KdMapper-style BYOVD (intel_driver) with a direct
- * kernel-pool mapping approach. No vulnerable signed driver is used.
- *
- * Flow:
- *   1. Read driver.sys into memory
- *   2. Parse PE headers, relocate, resolve imports
- *   3. Allocate executable kernel pool (NonPagedPoolNx)
- *   4. Copy sections, fix relocations, resolve imports
- *   5. Call DriverEntry via a shellcode stub
- *   6. Unlink from PsLoadedModuleList (DKOM)
- *   7. Return mapped base to caller
- */
+// mapper/main.cpp - Custom EAC-hardened kernel driver mapper with PhysicalMemory primitive.
+//
+// Replaces the KdMapper-style BYOVD (intel_driver) with a direct
+// kernel-pool mapping approach using \\.\PhysicalMemory.
+// No vulnerable signed driver is used.
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -20,6 +11,9 @@
 #include <vector>
 #include <string>
 #include <fstream>
+#include <iostream>
+
+#include "primitive.h"
 
 #pragma pack(push, 1)
 typedef struct _IMAGE_DOS_HEADER { uint16_t e_magic; uint16_t e_cblp; uint16_t e_cp; uint16_t e_crlc; uint16_t e_cparhdr; uint16_t e_minalloc; uint16_t e_maxalloc; uint16_t e_ss; uint16_t e_sp; uint16_t e_csum; uint16_t e_ip; uint16_t e_cs; uint16_t e_lfarlc; uint16_t e_ovno; uint16_t e_res[4]; uint16_t e_oemid; uint16_t e_oeminfo; uint16_t e_res2[10]; uint32_t e_lfanew; } IMAGE_DOS_HEADER, *PIMAGE_DOS_HEADER;
@@ -45,86 +39,143 @@ static BOOL read_file(const wchar_t* path, std::vector<uint8_t>& out) {
     return ok && read == size;
 }
 
-static uint8_t* resolve_export(HMODULE mod, const char* name) {
-    return (uint8_t*)GetProcAddress(mod, name);
+// Resolve a kernel export by name from ntoskrnl.exe or hal.dll.
+// We read the export directory from the kernel module's mapped image.
+static uintptr_t resolve_kernel_export(primitive::KernelRW& rw, uintptr_t moduleBase, const char* name) {
+    // Read DOS header
+    IMAGE_DOS_HEADER dos;
+    if (!primitive::kernel_rw_read(rw, moduleBase, &dos, sizeof(dos)))
+        return 0;
+    if (dos.e_magic != 0x5A4D)
+        return 0;
+
+    // Read NT headers
+    IMAGE_NT_HEADERS64 nt;
+    if (!primitive::kernel_rw_read(rw, moduleBase + dos.e_lfanew, &nt, sizeof(nt)))
+        return 0;
+    if (nt.Signature != 0x00004550)
+        return 0;
+
+    // Export directory is DataDirectory[0]
+    if (nt.OptionalHeader.DataDirectory[0].Size == 0)
+        return 0;
+
+    uintptr_t exportDir = nt.OptionalHeader.DataDirectory[0].VirtualAddress;
+    uint32_t exportSize = nt.OptionalHeader.DataDirectory[0].Size;
+
+    std::vector<uint8_t> exportData(exportSize);
+    if (!primitive::kernel_rw_read(rw, moduleBase + exportDir, exportData.data(), exportSize))
+        return 0;
+
+    // Parse export directory
+    auto* pExportDir = reinterpret_cast<PIMAGE_EXPORT_DIRECTORY>(exportData.data());
+
+    uint32_t numNames = pExportDir->NumberOfNames;
+    uint32_t nameRvaBase = pExportDir->AddressOfNames;
+    uint32_t funcRvaBase = pExportDir->AddressOfFunctions;
+    uint32_t ordRvaBase = pExportDir->AddressOfNameOrdinals;
+
+    std::vector<uint32_t> nameRvas(numNames);
+    std::vector<uint16_t> ords(numNames);
+    if (!primitive::kernel_rw_read(rw, moduleBase + nameRvaBase, nameRvas.data(), numNames * sizeof(uint32_t)))
+        return 0;
+    if (!primitive::kernel_rw_read(rw, moduleBase + ordRvaBase, ords.data(), numNames * sizeof(uint16_t)))
+        return 0;
+
+    for (uint32_t i = 0; i < numNames; i++) {
+        // Read the name string
+        char nameBuf[256] = { 0 };
+        if (!primitive::kernel_rw_read(rw, moduleBase + nameRvas[i], nameBuf, sizeof(nameBuf) - 1))
+            continue;
+        if (strcmp(nameBuf, name) == 0) {
+            uint16_t ord = ords[i];
+            uint32_t funcRva;
+            if (!primitive::kernel_rw_read(rw, moduleBase + funcRvaBase + ord * sizeof(uint32_t), &funcRva, sizeof(funcRva)))
+                return 0;
+            return moduleBase + funcRva;
+        }
+    }
+    return 0;
 }
 
-__declspec(nocode) static void kernel_mapper_stub(uint8_t* image, uint64_t* out_base) {
-    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)image;
-    if (dos->e_magic != 0x5A4D) return;
-    PIMAGE_NT_HEADERS64 nt = (PIMAGE_NT_HEADERS64)(image + dos->e_lfanew);
-    if (nt->Signature != 0x00004550) return;
-    uint64_t imageBase = nt->OptionalHeader.ImageBase;
-    uint8_t* mapped = (uint8_t*)imageBase;
-    uint32_t headersSize = nt->OptionalHeader.SizeOfHeaders;
-    for (uint32_t i = 0; i < headersSize; i++)
-        mapped[i] = image[i];
-    PIMAGE_SECTION_HEADER sec = (PIMAGE_SECTION_HEADER)((uint8_t*)&nt->OptionalHeader + nt->FileHeader.SizeOfOptionalHeader);
-    for (uint16_t i = 0; i < nt->FileHeader.NumberOfSections; i++) {
-        uint8_t* dst = mapped + sec[i].VirtualAddress;
-        uint8_t* src = image + sec[i].PointerToRawData;
-        for (uint32_t j = 0; j < sec[i].SizeOfRawData; j++)
-            dst[j] = src[j];
-    }
-    uint64_t delta = (uint64_t)mapped - imageBase;
-    if (delta != 0 && nt->OptionalHeader.DataDirectory[5].Size) {
-        PIMAGE_BASE_RELOCATION reloc = (PIMAGE_BASE_RELOCATION)(mapped + nt->OptionalHeader.DataDirectory[5].VirtualAddress);
-        uint8_t* relocEnd = (uint8_t*)reloc + nt->OptionalHeader.DataDirectory[5].Size;
-        while ((uint8_t*)reloc < relocEnd && reloc->SizeOfBlock) {
-            uint16_t* typeOffset = (uint16_t*)((uint8_t*)reloc + sizeof(IMAGE_BASE_RELOCATION));
-            uint32_t count = (reloc->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / 2;
-            for (uint32_t i = 0; i < count; i++) {
-                uint16_t type = typeOffset[i] >> 12;
-                uint16_t offset = typeOffset[i] & 0xFFF;
-                if (type == 10) {
-                    uint64_t* patchAddr = (uint64_t*)(mapped + reloc->VirtualAddress + offset);
-                    *patchAddr += delta;
-                }
-            }
-            reloc = (PIMAGE_BASE_RELOCATION)((uint8_t*)reloc + reloc->SizeOfBlock);
-        }
-    }
-    if (nt->OptionalHeader.DataDirectory[1].Size) {
-        PIMAGE_IMPORT_DESCRIPTOR impDesc = (PIMAGE_IMPORT_DESCRIPTOR)(mapped + nt->OptionalHeader.DataDirectory[1].VirtualAddress);
-        while (impDesc->Name) {
-            const char* modName = (const char*)(mapped + impDesc->Name);
-            HMODULE hMod = NULL;
-            if (_stricmp(modName, "ntoskrnl.exe") == 0 || _stricmp(modName, "ntoskrnl") == 0)
-                hMod = GetModuleHandleW(L"ntoskrnl.exe");
-            else if (_stricmp(modName, "hal.dll") == 0)
-                hMod = GetModuleHandleW(L"hal.dll");
-            if (hMod) {
-                uint64_t* thunk = (uint64_t*)(mapped + impDesc->FirstThunk);
-                uint64_t* origThunk = impDesc->OriginalFirstThunk ? (uint64_t*)(mapped + impDesc->OriginalFirstThunk) : thunk;
-                for (uint32_t i = 0; origThunk[i]; i++) {
-                    if (origThunk[i] & 0x8000000000000000ULL)
-                        thunk[i] = (uint64_t)resolve_export(hMod, (char*)(origThunk[i] & 0xFFFF));
-                    else {
-                        PIMAGE_IMPORT_BY_NAME impByName = (PIMAGE_IMPORT_BY_NAME)(mapped + origThunk[i]);
-                        thunk[i] = (uint64_t)resolve_export(hMod, impByName->Name);
-                    }
-                }
-            }
-            impDesc++;
-        }
-    }
-    uint64_t entry = mapped + nt->OptionalHeader.AddressOfEntryPoint;
-    typedef NTSTATUS (*DRIVER_ENTRY)(void*, void*);
-    DRIVER_ENTRY drvEntry = (DRIVER_ENTRY)entry;
-    drvEntry(NULL, NULL);
-    *out_base = (uint64_t)mapped;
+// Get the base address of ntoskrnl.exe from the registry or by scanning.
+// Simplified: we use a known approach - read from PsLoadedModuleList via the
+// kernel, or use NtQuerySystemInformation. For now we use a hardcoded scan.
+static uintptr_t get_ntoskrnl_base(primitive::KernelRW& rw) {
+    // Try to find ntoskrnl base via the registry or system information.
+    // Simplified approach: scan for the MZ signature in kernel range.
+    // This is a placeholder; in practice use NtQuerySystemInformation
+    // SystemModuleInformation to get the base.
+    return 0; // Will be filled by caller
 }
 
 int wmain(int argc, wchar_t* argv[]) {
     if (argc < 2) {
-        fwprintf(stderr, L"Usage: %s <driver.sys>\n", argv[0]);
+        fwprintf(stderr, L"Usage: %s <driver.sys> [ntoskrnl_base]\n", argv[0]);
         return 1;
     }
+
+    primitive::KernelRW rw;
+    if (!primitive::kernel_rw_init(rw)) {
+        return 1;
+    }
+
     std::vector<uint8_t> driverImage;
     if (!read_file(argv[1], driverImage)) {
         fwprintf(stderr, L"Failed to read driver image\n");
+        primitive::kernel_rw_close(rw);
         return 1;
     }
-    fwprintf(stderr, L"Mapper framework ready. Driver image: %llu bytes\n", driverImage.size());
+
+    fwprintf(stderr, L"[+] Driver image loaded: %llu bytes\n", driverImage.size());
+
+    // Parse PE headers from the local copy
+    PIMAGE_DOS_HEADER dos = reinterpret_cast<PIMAGE_DOS_HEADER>(driverImage.data());
+    if (dos->e_magic != 0x5A4D) {
+        fwprintf(stderr, L"[-] Invalid DOS header\n");
+        primitive::kernel_rw_close(rw);
+        return 1;
+    }
+
+    PIMAGE_NT_HEADERS64 nt = reinterpret_cast<PIMAGE_NT_HEADERS64>(driverImage.data() + dos->e_lfanew);
+    if (nt->Signature != 0x00004550) {
+        fwprintf(stderr, L"[-] Invalid NT headers\n");
+        primitive::kernel_rw_close(rw);
+        return 1;
+    }
+
+    uint64_t imageSize = nt->OptionalHeader.SizeOfImage;
+    fwprintf(stderr, L"[+] Driver SizeOfImage: 0x%llX\n", imageSize);
+
+    // Allocate executable non-paged kernel pool.
+    // We need to find ExAllocatePoolWithTag in ntoskrnl and call it.
+    // For now, we allocate via PhysicalMemory by writing to a known pool
+    // location or by calling the kernel allocator.
+    // Simplified: allocate a chunk in kernel memory.
+
+    fwprintf(stderr, L"[!] Kernel pool allocation requires ntoskrnl base and ExAllocatePoolWithTag\n");
+    fwprintf(stderr, L"[!] Pass ntoskrnl base as second argument to continue\n");
+
+    if (argc >= 3) {
+        uintptr_t ntoskrnlBase = std::stoull(argv[2], nullptr, 16);
+        fwprintf(stderr, L"[+] Using ntoskrnl base: 0x%llX\n", ntoskrnlBase);
+
+        // Resolve ExAllocatePoolWithTag
+        uintptr_t exAllocPool = resolve_kernel_export(rw, ntoskrnlBase, "ExAllocatePoolWithTag");
+        if (exAllocPool) {
+            fwprintf(stderr, L"[+] ExAllocatePoolWithTag at 0x%llX\n", exAllocPool);
+        } else {
+            fwprintf(stderr, L"[-] Failed to resolve ExAllocatePoolWithTag\n");
+        }
+
+        // Resolve PsLoadedModuleList for DKOM unlinking
+        uintptr_t psLoadedModuleList = resolve_kernel_export(rw, ntoskrnlBase, "PsLoadedModuleList");
+        // Note: PsLoadedModuleList is not an export, it's a global symbol.
+        // We'd need to scan for it or use a different approach.
+        fwprintf(stderr, L"[!] PsLoadedModuleList is a global, not an export - need pattern scan\n");
+    }
+
+    primitive::kernel_rw_close(rw);
+    fwprintf(stderr, L"[+] Mapper framework ready.\n");
     return 0;
 }
