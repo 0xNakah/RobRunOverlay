@@ -26,6 +26,7 @@ typedef struct _IMAGE_IMPORT_DESCRIPTOR { uint32_t OriginalFirstThunk; uint32_t 
 typedef struct _IMAGE_THUNK_DATA64 { uint64_t u1; } IMAGE_THUNK_DATA64, *PIMAGE_THUNK_DATA64;
 typedef struct _IMAGE_IMPORT_BY_NAME { uint16_t Hint; char Name[1]; } IMAGE_IMPORT_BY_NAME, *PIMAGE_IMPORT_BY_NAME;
 typedef struct _IMAGE_BASE_RELOCATION { uint32_t VirtualAddress; uint32_t SizeOfBlock; } IMAGE_BASE_RELOCATION, *PIMAGE_BASE_RELOCATION;
+typedef struct _IMAGE_EXPORT_DIRECTORY { uint32_t Characteristics; uint32_t TimeDateStamp; uint16_t MajorVersion; uint16_t MinorVersion; uint32_t Name; uint32_t Base; uint32_t NumberOfFunctions; uint32_t NumberOfNames; uint32_t AddressOfFunctions; uint32_t AddressOfNames; uint32_t AddressOfNameOrdinals; } IMAGE_EXPORT_DIRECTORY, *PIMAGE_EXPORT_DIRECTORY;
 #pragma pack(pop)
 
 static BOOL read_file(const wchar_t* path, std::vector<uint8_t>& out) {
