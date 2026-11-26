@@ -7,21 +7,26 @@ It also contains privileged and state-changing operations. Read their code
 before using them; the offline exercises below need no running game or driver.
 
 This folder has two Markdown guides: **README.md** explains the project and
-**[BUILD.md](BUILD.md)** explains builds, validation and offset maintenance.
-The source headers explain local contracts. JSON files in `offsets` retain
+**[BUILD.md](docs/BUILD.md)** explains builds, validation and offset maintenance.
+The source headers explain local contracts. JSON files in `data/offsets` retain
 field and rig provenance. Historical session logs and separate research notes
 are not part of this teaching edition.
+
+The repository was restructured from the original `1_run`, `2_src_port`,
+`3_src_driver`, `4_src_mapper`, `5_src_loader` layout; see `REORGANIZE.md`
+for the move map and migration steps.
 
 ## Folder map
 
 | Path | Purpose |
 |---|---|
-| `1_run/` | Prebuilt artifacts, settings and launch scripts |
-| `2_src_port/` | Overlay, reader, renderer, menu and build script |
-| `3_src_driver/` | WmPort kernel driver and its build script |
-| `4_src_mapper/kd2_src/` | Mapper solution and source |
-| `offsets/` | Managed field definitions and rig provenance in JSON |
-| `tools/` | Offset generation and auditing scripts |
+| `artifacts/run/` | Prebuilt artifacts, settings and launch scripts |
+| `overlay/` | Overlay, reader, renderer, menu and build script |
+| `driver/` | WmPort kernel driver and its build script |
+| `mapper-analysis/kd2_src/` | Old mapper solution and source, preserved unchanged for study; no operational replacement is maintained |
+| `launcher/` | AIO launcher solution and source |
+| `data/offsets/` | Managed field definitions and rig provenance in JSON |
+| `scripts/` | Offset generation and auditing scripts |
 
 The overlay build produces `RobRunPort.exe`. Some identifiers and log strings
 retain older names such as `RobRunESP` or `RobRunAIO`; they do not identify
@@ -30,30 +35,31 @@ earlier builds. Rebuilding is how to validate the source you are studying.
 
 ## Suggested reading order
 
-1. Read [rr_game.h](2_src_port/rr_game.h) to understand `RR_PLAYER`, `RR_CAMERA`
+1. Read [rr_game.h](overlay/rr_game.h) to understand `RR_PLAYER`, `RR_CAMERA`
    and the snapshot API. Addresses are `uint64_t` values in another process;
    they cannot be dereferenced as ordinary local pointers.
-2. Read [rr_unity.h](2_src_port/rr_unity.h) and
-   [rr_unity.c](2_src_port/rr_unity.c) for object, string, array and dictionary
+2. Read [rr_unity.h](overlay/rr_unity.h) and
+   [rr_unity.c](overlay/rr_unity.c) for object, string, array and dictionary
    access. Separate a valid zero value from a failed memory read.
-3. Follow [rr_mem.h](2_src_port/rr_mem.h) into
-   [rr_mem.c](2_src_port/rr_mem.c). Study request layouts, reply limits,
+3. Follow [rr_mem.h](overlay/rr_mem.h) into
+   [rr_mem.c](overlay/rr_mem.c). Study request layouts, reply limits,
    return values and the thread-local small-read status.
 4. Follow `game_init()`, `scan_worker()` and `game_snapshot()` in
-   [rr_game.c](2_src_port/rr_game.c). Note where identities are checked and
+   [rr_game.c](overlay/rr_game.c). Note where identities are checked and
    where a lock protects publication rather than the whole scan.
-5. Follow `game_w2s()` into [rr_draw.c](2_src_port/rr_draw.c) and
-   [gpu.cpp](2_src_port/gpu.cpp). Track world coordinates through camera space
+5. Follow `game_w2s()` into [rr_draw.c](overlay/rr_draw.c) and
+   [gpu.cpp](overlay/gpu.cpp). Track world coordinates through camera space
    to screen pixels, then through drawing and presentation.
-6. Read [menu_bridge.h](2_src_port/menu_bridge.h),
-   [menu_webview.cpp](2_src_port/menu_webview.cpp) and
-   [menu.html](2_src_port/menu.html) together. Trace a slider from a page message
+6. Read [menu_bridge.h](overlay/menu_bridge.h),
+   [menu_webview.cpp](overlay/menu_webview.cpp) and
+   [menu.html](overlay/menu.html) together. Trace a slider from a page message
    to a validated setting and back to serialized state.
 7. Read `WinMain`, `ReadThread`, `RenderThread` and `OverlayProc` in
-   [rr_esp.c](2_src_port/rr_esp.c) to see how the pieces are scheduled.
-8. Study [wm_drv.c](3_src_driver/wm_drv.c) with its wire contract in
-   [smx.h](3_src_driver/smx.h), then the mapper, after understanding the
-   user-mode contracts. Their source is separate from the offline lessons.
+   [rr_esp.c](overlay/rr_esp.c) to see how the pieces are scheduled.
+8. Study [wm_drv.c](driver/wm_drv.c) with its wire contract in
+   [wm.h](driver/wm.h), then the mapper under `mapper-analysis/`, after
+   understanding the user-mode contracts. Their source is separate from the
+   offline lessons.
 
 ## How one frame works
 
@@ -142,11 +148,11 @@ Abrupt branch changes are confirmed over a bounded interval in `rr_pose_gate.h`.
 This reduces brief alternate poses while adding a short delay to abrupt motion.
 The shared reference mesh can differ from the character's clothing or equipment.
 The original asset exporter is not included; provenance remains in
-`offsets/robrun_rig.json` and the generated headers.
+`data/offsets/robrun_rig.json` and the generated headers.
 
 ## Offline exercises
 
-Build the overlay using BUILD.md, then run these commands from `2_src_port`:
+Build the overlay using docs/BUILD.md, then run these commands from `overlay`:
 
 ```powershell
 .\RobRunPort.exe --selftest --nohide --no-pause
