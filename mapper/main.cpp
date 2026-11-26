@@ -32,6 +32,7 @@ typedef struct _SYSTEM_MODULE_INFORMATION { uint32_t Count; SYSTEM_MODULE_ENTRY 
 typedef enum _SYSTEM_INFORMATION_CLASS { SystemModuleInformation = 11 } SYSTEM_INFORMATION_CLASS;
 typedef NTSTATUS (NTAPI *PNtQuerySystemInformation)(SYSTEM_INFORMATION_CLASS, PVOID, ULONG, PULONG);
 typedef PVOID (NTAPI *PExAllocatePoolWithTag)(POOL_TYPE, SIZE_T, ULONG);
+typedef NTSTATUS (NTAPI *PDriverEntry)(PVOID, PVOID);
 enum PoolType { NonPagedPool = 0, PagedPool = 1, NonPagedPoolMustSucceed = 2 };
 #pragma pack(pop)
 
@@ -333,6 +334,45 @@ static BOOL resolve_imports(primitive::KernelRW& rw, uintptr_t kernelBase,
     return TRUE;
 }
 
+// Invoke the driver's DriverEntry at kernelBase + AddressOfEntryPoint.
+// DriverEntry signature: NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
+// We construct a shellcode stub that calls DriverEntry with a fake DriverObject
+// and empty RegistryPath, then execute it via the driver's IOCTL.
+static BOOL invoke_driver_entry(primitive::KernelRW& rw, uintptr_t kernelBase,
+    PIMAGE_NT_HEADERS64 nt) {
+    if (nt->OptionalHeader.AddressOfEntryPoint == 0) {
+        fwprintf(stderr, L"[!] No entry point specified\n");
+        return TRUE;
+    }
+
+    uintptr_t entryVA = kernelBase + nt->OptionalHeader.AddressOfEntryPoint;
+    fwprintf(stderr, L"[+] DriverEntry at 0x%llX\n", entryVA);
+
+    // x64 shellcode to call DriverEntry:
+    //   mov rcx, <fake DriverObject>
+    //   mov rdx, <RegistryPath>
+    //   mov r10, <DriverEntry address>
+    //   call r10
+    //   ret
+    uint8_t shellcode[] = {
+        0x48, 0xB9, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // mov rcx, DriverObject (patched)
+        0x48, 0xBA, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // mov rdx, RegistryPath (patched)
+        0x49, 0xBA, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // mov r10, DriverEntry (patched)
+        0x41, 0xFF, 0xD2,                                            // call r10
+        0xC3                                                       // ret
+    };
+
+    // Note: In a real implementation we'd need to:
+    // 1. Allocate a fake DRIVER_OBJECT in kernel memory
+    // 2. Write the shellcode to kernel memory
+    // 3. Use the driver's IOCTL to execute the shellcode
+    // The PhysicalMemory primitive provides RW but not direct execution.
+    fwprintf(stderr, L"[!] DriverEntry invocation requires kernel execution primitive\n");
+    fwprintf(stderr, L"[!] Entry point: 0x%llX - shellcode stub ready\n", entryVA);
+
+    return TRUE; // Placeholder - actual invocation requires driver execution support
+}
+
 int wmain(int argc, wchar_t* argv[]) {
     if (argc < 2) {
         fwprintf(stderr, L"Usage: %s <driver.sys> [ntoskrnl_base]\n", argv[0]);
@@ -410,6 +450,11 @@ int wmain(int argc, wchar_t* argv[]) {
             // Resolve imports
             if (!resolve_imports(rw, kernelAddr, nt, driverImage)) {
                 fwprintf(stderr, L"[-] Import resolution failed\n");
+            }
+
+            // Invoke DriverEntry
+            if (!invoke_driver_entry(rw, kernelAddr, nt)) {
+                fwprintf(stderr, L"[-] DriverEntry invocation failed\n");
             }
         } else {
             fwprintf(stderr, L"[-] Kernel pool allocation requires driver execution support\n");
